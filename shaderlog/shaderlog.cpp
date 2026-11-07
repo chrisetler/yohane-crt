@@ -23,18 +23,21 @@
 // copies the finished level back before the glow pass and HUD, one of the shaders compiled from
 // <game>\crt\*.hlsl is bound instead. F7 cycles them, F8 recompiles, F9 toggles.
 //
+// HDR output (opt-in through <game>\crt\hdr.ini): see "HDR output" below. F6 toggles highlights.
+//
 // Builds: the default build is the diagnostic one described above. Defining CRT_RELEASE
 // compiles out the shader dumps, render-target logging, F10/F11 captures and the extra draw
 // hooks, leaving only the CRT swap and its keys. The release build logs to <game>\crt\log.txt,
 // rewritten each launch.
 
-#define CRT_VERSION "1.0.0"
+#define CRT_VERSION "1.1.0-dev"
 
 #define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <d3d11.h>
-#include <dxgi1_2.h>
+#include <dxgi1_6.h>
 #include <d3dcompiler.h>
 #include <cstdio>
 #include <cstdint>
@@ -347,12 +350,64 @@ static bool ReadText(const std::string& path, std::string& out) {
     return true;
 }
 
+// ---------------------------------------------------------------------------------------------
+// HDR output, opt-in through <game>\crt\hdr.ini ("enabled" is read at launch; F8 rereads the rest).
+// The swap chain becomes scRGB (FP16, linear, 1.0 = 80 nits) and the game's 1080p working image
+// becomes FP16, so values above 1.0 from the filter survive the glow, HUD and final scale. A
+// last pass before Present turns the game's gamma-encoded SDR values into light: 1.0 is paper
+// white, and anything brighter (only the filter's beams get there) rolls off toward the peak.
+// F6 switches highlights off: filters built as for SDR and the output clipped at paper white.
+
+static bool g_hdr;                    // hdr.ini says enabled
+static bool g_hdrActive;              // the swap chain really is scRGB
+static bool g_hdrHighlights = true;   // F6
+static float g_paperWhite = 200.0f;   // nits for SDR white (HUD, menus, cutscenes)
+static float g_peak;                  // nits; 0 = what the display reports
+static float g_crtBoost = 1.5f;       // linear gain on the filter's output
+static float g_displayPeak;           // reported by the display; 0 = unknown
+
+static float HdrPeak() { return g_peak > 0 ? g_peak : g_displayPeak > 0 ? g_displayPeak : 1000.0f; }
+
+static void LoadHdrConfig(bool atLaunch) {
+    std::string s;
+    if (!ReadText(CrtDir() + "hdr.ini", s)) return;
+    auto trim = [](const std::string& t) {
+        size_t a = t.find_first_not_of(" \t\r"), b = t.find_last_not_of(" \t\r");
+        return a == std::string::npos ? std::string() : t.substr(a, b - a + 1);
+    };
+    for (size_t p = 0; p < s.size();) {
+        size_t e = s.find('\n', p);
+        if (e == std::string::npos) e = s.size();
+        std::string line = s.substr(p, e - p);
+        p = e + 1;
+        line = line.substr(0, line.find(';'));
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string k = trim(line.substr(0, eq)), v = trim(line.substr(eq + 1));
+        if (k == "enabled" && atLaunch) g_hdr = v == "1" || _stricmp(v.c_str(), "true") == 0;
+        else if (k == "paper_white") g_paperWhite = (float)atof(v.c_str());
+        else if (k == "peak") g_peak = _stricmp(v.c_str(), "auto") == 0 ? 0.0f : (float)atof(v.c_str());
+        else if (k == "crt_boost") g_crtBoost = (float)atof(v.c_str());
+    }
+    g_paperWhite = std::min(std::max(g_paperWhite, 80.0f), 1000.0f);
+    g_crtBoost = std::min(std::max(g_crtBoost, 1.0f), 10.0f);
+    if (g_peak > 0) g_peak = std::max(g_peak, g_paperWhite);
+    if (g_hdr) {
+        char peak[32];
+        sprintf_s(peak, g_peak > 0 ? "%.0f nits" : "auto", g_peak);
+        Log("HDR: on, paper white %.0f nits, peak %s, filter boost %.2f", g_paperWhite, peak, g_crtBoost);
+    }
+}
+
 static ID3D11PixelShader* CompileCrt(const std::string& name) {
     std::string src;
     if (!ReadText(CrtDir() + name, src)) return nullptr;
     PFN_Compile compile = g_compile47 ? g_compile47 : g_compile;
     ID3DBlob *code = nullptr, *err = nullptr;
-    HRESULT hr = compile ? compile(src.data(), src.size(), name.c_str(), nullptr, nullptr, "main", "ps_5_0",
+    char boost[32];
+    sprintf_s(boost, "%f", g_crtBoost);
+    D3D_SHADER_MACRO hdr[] = {{"CRT_HDR", "1"}, {"CRT_HDR_BOOST", boost}, {nullptr, nullptr}};
+    HRESULT hr = compile ? compile(src.data(), src.size(), name.c_str(), g_hdrActive && g_hdrHighlights ? hdr : nullptr, nullptr, "main", "ps_5_0",
                                    D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err)
                          : E_FAIL;
     ID3D11PixelShader* ps = nullptr;
@@ -432,6 +487,10 @@ static void LoadCrt() {
 // ---------------------------------------------------------------------------------------------
 // ID3D11DeviceContext hooks (vtable slots)
 
+#ifndef CRT_RELEASE
+static void DumpOnFirstUse(ID3D11Resource* res, UINT slot);
+#endif
+
 typedef void(STDMETHODCALLTYPE* PFN_PSSetSRV)(ID3D11DeviceContext*, UINT, UINT, ID3D11ShaderResourceView* const*);
 typedef void(STDMETHODCALLTYPE* PFN_SetPS)(ID3D11DeviceContext*, ID3D11PixelShader*, ID3D11ClassInstance* const*, UINT);
 typedef void(STDMETHODCALLTYPE* PFN_SetVS)(ID3D11DeviceContext*, ID3D11VertexShader*, ID3D11ClassInstance* const*, UINT);
@@ -466,7 +525,7 @@ static PFN_Resolve o_Resolve;
 // adopts whatever the runtime last put in a slot as the "original" to call.
 struct Slot { int index; void* hook; void** orig; };
 static void** g_ctxVt;
-static Slot g_slots[13];
+static Slot g_slots[14];
 static int g_slotCount;
 
 static void Repatch() {
@@ -484,6 +543,15 @@ static void STDMETHODCALLTYPE H_PSSetSRV(ID3D11DeviceContext* c, UINT start, UIN
         g_srv0Res = nullptr;
         if (v && v[0]) { v[0]->GetResource(&g_srv0Res); g_srv0Res->Release(); }  // the game's binding keeps it alive
     }
+#ifndef CRT_RELEASE
+    for (UINT i = 0; i < n && v; i++)
+        if (v[i]) {
+            ID3D11Resource* r = nullptr;
+            v[i]->GetResource(&r);
+            DumpOnFirstUse(r, start + i);
+            r->Release();
+        }
+#endif
     if (g_cap)
         for (UINT i = 0; i < n; i++) {
             if (start + i == 0) g_srv0 = ViewDesc(v ? v[i] : nullptr);
@@ -565,13 +633,26 @@ static void STDMETHODCALLTYPE H_SetVP(ID3D11DeviceContext* c, UINT n, const D3D1
     }
     Repatch();
 }
+static bool HdrCopyMismatch(ID3D11Resource* dst, ID3D11Resource* src);
+static bool BlitCopy(ID3D11Resource* dst, ID3D11Resource* src);
+static void LogCopyMismatch(const char* what, ID3D11Resource* dst, ID3D11Resource* src, bool fixed);
+
 static void STDMETHODCALLTYPE H_CopySub(ID3D11DeviceContext* c, ID3D11Resource* dst, UINT a, UINT x, UINT y, UINT z, ID3D11Resource* src, UINT b, const D3D11_BOX* box) {
     if (g_cap && !g_inSnap) { Lock l; CapEvent("COPY region %s -> %s", ResDesc(src).c_str(), ResDesc(dst).c_str()); }
+    if (g_hdr && !g_inSnap) { Lock l; if (HdrCopyMismatch(dst, src)) LogCopyMismatch("copied region", dst, src, false); }
     o_CopySub(c, dst, a, x, y, z, src, b, box);
     if (g_cap) { Lock l; Repatch(); }
 }
 static void STDMETHODCALLTYPE H_Copy(ID3D11DeviceContext* c, ID3D11Resource* dst, ID3D11Resource* src) {
     if (g_cap) { Lock l; CapEvent("COPY %s -> %s", ResDesc(src).c_str(), ResDesc(dst).c_str()); }
+    if (g_hdr && !g_inSnap) {
+        Lock l;
+        if (HdrCopyMismatch(dst, src)) {
+            bool ok = BlitCopy(dst, src);
+            LogCopyMismatch("copied", dst, src, ok);
+            if (ok) { Repatch(); return; }
+        }
+    }
     o_Copy(c, dst, src);
     if (g_cap) { Lock l; Repatch(); }
 }
@@ -586,6 +667,12 @@ static void STDMETHODCALLTYPE H_Resolve(ID3D11DeviceContext* c, ID3D11Resource* 
     if (g_cap) { Lock l; Repatch(); }
 }
 
+#ifndef CRT_RELEASE
+typedef void(STDMETHODCALLTYPE* PFN_UpdateSub)(ID3D11DeviceContext*, ID3D11Resource*, UINT, const D3D11_BOX*, const void*, UINT, UINT);
+static PFN_UpdateSub o_UpdateSub;
+static void STDMETHODCALLTYPE H_UpdateSub(ID3D11DeviceContext*, ID3D11Resource*, UINT, const D3D11_BOX*, const void*, UINT, UINT);
+#endif
+
 static void HookContext(ID3D11DeviceContext* ctx) {
     Slot s[] = {
         {9, H_SetPS, (void**)&o_SetPS},  // first: the only one the release build needs
@@ -599,6 +686,9 @@ static void HookContext(ID3D11DeviceContext* ctx) {
     };
     memcpy(g_slots, s, sizeof s);
     g_slotCount = (int)(sizeof s / sizeof s[0]);
+#ifndef CRT_RELEASE
+    g_slots[g_slotCount++] = {48, H_UpdateSub, (void**)&o_UpdateSub};  // texture dumps
+#endif
     void** vt = *(void***)ctx;
     for (int i = 0; i < g_slotCount; i++) Patch(&vt[g_slots[i].index], g_slots[i].hook, g_slots[i].orig);
     g_ctxVt = vt;
@@ -666,8 +756,78 @@ static int SceneFor(ID3D11Resource* res) {
     return found;
 }
 
+// Everything our own full-screen passes change, saved before and put back after.
+struct GameState {
+    ID3D11VertexShader* vs = nullptr; ID3D11ClassInstance* vsCI[256]; UINT vsN = 256;
+    ID3D11PixelShader* ps = nullptr; ID3D11ClassInstance* psCI[256]; UINT psN = 256;
+    ID3D11InputLayout* il = nullptr;
+    D3D11_PRIMITIVE_TOPOLOGY topo;
+    ID3D11ShaderResourceView* srv0 = nullptr;
+    ID3D11BlendState* bs = nullptr; FLOAT bf[4]; UINT bm;
+    ID3D11DepthStencilState* ds = nullptr; UINT sref;
+    ID3D11RasterizerState* rs = nullptr;
+    bool targets;  // also the render targets and viewports
+    ID3D11RenderTargetView* rtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+    ID3D11DepthStencilView* dsv = nullptr;
+    D3D11_VIEWPORT vp[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+    UINT vpN = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+
+    GameState(ID3D11DeviceContext* c, bool withTargets) : targets(withTargets) {
+        c->VSGetShader(&vs, vsCI, &vsN);
+        c->PSGetShader(&ps, psCI, &psN);
+        c->IAGetInputLayout(&il);
+        c->IAGetPrimitiveTopology(&topo);
+        c->PSGetShaderResources(0, 1, &srv0);
+        c->OMGetBlendState(&bs, bf, &bm);
+        c->OMGetDepthStencilState(&ds, &sref);
+        c->RSGetState(&rs);
+        if (targets) {
+            c->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtv, &dsv);
+            c->RSGetViewports(&vpN, vp);
+        }
+    }
+    void Restore(ID3D11DeviceContext* c) {
+        c->VSSetShader(vs, vsCI, vsN);
+        c->PSSetShader(ps, psCI, psN);
+        c->IASetInputLayout(il);
+        c->IASetPrimitiveTopology(topo);
+        c->PSSetShaderResources(0, 1, &srv0);
+        c->OMSetBlendState(bs, bf, bm);
+        c->OMSetDepthStencilState(ds, sref);
+        c->RSSetState(rs);
+        if (targets) {
+            c->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtv, dsv);
+            c->RSSetViewports(vpN, vp);
+        }
+        if (vs) vs->Release();
+        for (UINT i = 0; i < vsN; i++) if (vsCI[i]) vsCI[i]->Release();
+        if (ps) ps->Release();
+        for (UINT i = 0; i < psN; i++) if (psCI[i]) psCI[i]->Release();
+        if (il) il->Release();
+        if (srv0) srv0->Release();
+        if (bs) bs->Release();
+        if (ds) ds->Release();
+        if (rs) rs->Release();
+        for (auto* v : rtv) if (v) v->Release();
+        if (dsv) dsv->Release();
+    }
+};
+
+static void DrawFullscreen(ID3D11DeviceContext* c, ID3D11PixelShader* ps, ID3D11ShaderResourceView* srv) {
+    c->VSSetShader(g_fullscreenVS, nullptr, 0);
+    c->PSSetShader(ps, nullptr, 0);
+    c->IASetInputLayout(nullptr);
+    c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    c->PSSetShaderResources(0, 1, &srv);
+    c->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+    c->OMSetDepthStencilState(g_noDepth, 0);
+    c->RSSetState(nullptr);
+    c->Draw(3, 0);
+}
+
 static void LoadScenePass() {
     if (g_fullscreenVS || !g_dev) return;
+    LoadReal();
     // Same output layout as the game's vertex shader, so the filters' PSIn matches.
     static const char* vs =
         "struct O{float4 pos:SV_Position;float4 c0:COLOR0;float4 c1:COLOR1;float2 uv:TEXCOORD0;};"
@@ -713,47 +873,9 @@ static void RunScenePass(ID3D11Resource* target) {
     g_inScenePass = g_inSnap = true;
     c->CopySubresourceRegion(g_sceneCopy, 0, 0, 0, 0, target, 0, nullptr);
 
-    // save the state we touch
-    ID3D11VertexShader* vs = nullptr; ID3D11ClassInstance* vsCI[256]; UINT vsN = 256;
-    ID3D11PixelShader* ps = nullptr; ID3D11ClassInstance* psCI[256]; UINT psN = 256;
-    c->VSGetShader(&vs, vsCI, &vsN);
-    c->PSGetShader(&ps, psCI, &psN);
-    ID3D11InputLayout* il = nullptr; c->IAGetInputLayout(&il);
-    D3D11_PRIMITIVE_TOPOLOGY topo; c->IAGetPrimitiveTopology(&topo);
-    ID3D11ShaderResourceView* srv0 = nullptr; c->PSGetShaderResources(0, 1, &srv0);
-    ID3D11BlendState* bs = nullptr; FLOAT bf[4]; UINT bm; c->OMGetBlendState(&bs, bf, &bm);
-    ID3D11DepthStencilState* ds = nullptr; UINT sref; c->OMGetDepthStencilState(&ds, &sref);
-    ID3D11RasterizerState* rs = nullptr; c->RSGetState(&rs);
-
-    // draw the filter over the whole target
-    c->VSSetShader(g_fullscreenVS, nullptr, 0);
-    c->PSSetShader(g_crtPS, nullptr, 0);
-    c->IASetInputLayout(nullptr);
-    c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    c->PSSetShaderResources(0, 1, &g_sceneCopySRV);
-    c->OMSetBlendState(nullptr, nullptr, 0xffffffff);
-    c->OMSetDepthStencilState(g_noDepth, 0);
-    c->RSSetState(nullptr);
-    c->Draw(3, 0);
-
-    // put the game's state back
-    c->VSSetShader(vs, vsCI, vsN);
-    c->PSSetShader(ps, psCI, psN);
-    c->IASetInputLayout(il);
-    c->IASetPrimitiveTopology(topo);
-    c->PSSetShaderResources(0, 1, &srv0);
-    c->OMSetBlendState(bs, bf, bm);
-    c->OMSetDepthStencilState(ds, sref);
-    c->RSSetState(rs);
-    if (vs) vs->Release();
-    for (UINT i = 0; i < vsN; i++) if (vsCI[i]) vsCI[i]->Release();
-    if (ps) ps->Release();
-    for (UINT i = 0; i < psN; i++) if (psCI[i]) psCI[i]->Release();
-    if (il) il->Release();
-    if (srv0) srv0->Release();
-    if (bs) bs->Release();
-    if (ds) ds->Release();
-    if (rs) rs->Release();
+    GameState st(c, false);
+    DrawFullscreen(c, g_crtPS, g_sceneCopySRV);  // the filter over the whole target
+    st.Restore(c);
     g_inScenePass = g_inSnap = false;
 }
 
@@ -774,6 +896,176 @@ static void SceneAfterDraw() {
 #ifndef CRT_RELEASE
     if (g_cap) CapEvent("SCENE PASS (%s)", kScenes[sc].name);
 #endif
+}
+
+// ---------------------------------------------------------------------------------------------
+// HDR output: the pass before Present, and copies the FP16 working image no longer matches.
+
+static const char* kHdrPS = R"(
+Texture2D Img : register(t0);
+float4 main(float4 pos : SV_Position) : SV_Target {
+    // the game's values are gamma-encoded for an SDR screen; 1.0 = paper white
+    float3 x = pow(max(Img.Load(int3(pos.xy, 0)).rgb, 0.0), 2.2);
+#if HIGHLIGHTS
+    float k = PEAK_REL - 1.0;  // headroom above paper white; roll off smoothly into it
+    x = k > 0.0 ? (x > 1.0 ? 1.0 + k * (1.0 - exp(-(x - 1.0) / k)) : x) : min(x, 1.0);
+#else
+    x = min(x, 1.0);
+#endif
+    return float4(x * PAPER, 1.0);  // scRGB: 1.0 = 80 nits
+})";
+static const char* kBlitPS = "Texture2D t:register(t0);float4 main(float4 p:SV_Position):SV_Target{return t.Load(int3(p.xy,0));}";
+
+static ID3D11PixelShader* g_hdrPS;
+static ID3D11PixelShader* g_blitPS;
+static ID3D11Texture2D* g_hdrCopy;
+static ID3D11ShaderResourceView* g_hdrCopySRV;
+
+static ID3D11PixelShader* CompilePS(const char* src, const D3D_SHADER_MACRO* defs, const char* name) {
+    LoadReal();
+    PFN_Compile compile = g_compile47 ? g_compile47 : g_compile;
+    ID3DBlob *code = nullptr, *err = nullptr;
+    ID3D11PixelShader* ps = nullptr;
+    if (compile && SUCCEEDED(compile(src, strlen(src), name, defs, nullptr, "main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err)))
+        o_CreatePS(g_dev, code->GetBufferPointer(), code->GetBufferSize(), nullptr, &ps);
+    else
+        Log("HDR: %s compile FAILED: %.*s", name, err ? (int)err->GetBufferSize() : 0, err ? (const char*)err->GetBufferPointer() : "");
+    if (code) code->Release();
+    if (err) err->Release();
+    return ps;
+}
+
+static void BuildHdrShader() {
+    if (!g_dev) return;
+    if (g_hdrPS) { g_hdrPS->Release(); g_hdrPS = nullptr; }
+    char paper[32], peak[32];
+    sprintf_s(paper, "%f", g_paperWhite / 80.0f);
+    sprintf_s(peak, "%f", HdrPeak() / g_paperWhite);
+    D3D_SHADER_MACRO d[] = {{"PAPER", paper}, {"PEAK_REL", peak}, {"HIGHLIGHTS", g_hdrHighlights ? "1" : "0"}, {nullptr, nullptr}};
+    g_hdrPS = CompilePS(kHdrPS, d, "hdr_output");
+}
+
+static void QueryDisplay(IDXGISwapChain* sc) {
+    IDXGIOutput* o = nullptr;
+    IDXGIOutput6* o6 = nullptr;
+    if (SUCCEEDED(sc->GetContainingOutput(&o)) && SUCCEEDED(o->QueryInterface(__uuidof(IDXGIOutput6), (void**)&o6))) {
+        DXGI_OUTPUT_DESC1 d;
+        if (SUCCEEDED(o6->GetDesc1(&d))) {
+            bool on = d.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+            g_displayPeak = on ? d.MaxLuminance : 0.0f;
+            Log("HDR: display %ls: Windows HDR %s, reports peak %.0f nits, full-frame %.0f nits; using peak %.0f",
+                d.DeviceName, on ? "on" : "OFF (highlights will clip; turn on HDR in Windows display settings)",
+                d.MaxLuminance, d.MaxFullFrameLuminance, HdrPeak());
+        }
+    } else {
+        Log("HDR: couldn't query the display");
+    }
+    if (o6) o6->Release();
+    if (o) o->Release();
+}
+
+// Turns the finished SDR frame in the (FP16) back buffer into scRGB, in place.
+static void HdrPass(IDXGISwapChain* sc) {
+    LoadScenePass();
+    static bool queried;
+    if (!queried) {
+        queried = true;
+        QueryDisplay(sc);
+        BuildHdrShader();
+    }
+    if (!g_fullscreenVS || !g_noDepth || !g_hdrPS) return;
+    ID3D11Texture2D* bb = nullptr;
+    if (FAILED(sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&bb))) return;
+    D3D11_TEXTURE2D_DESC d;
+    bb->GetDesc(&d);
+    if (g_hdrCopy) {
+        D3D11_TEXTURE2D_DESC cd;
+        g_hdrCopy->GetDesc(&cd);
+        if (cd.Width != d.Width || cd.Height != d.Height || cd.Format != d.Format) {
+            g_hdrCopySRV->Release(); g_hdrCopySRV = nullptr;
+            g_hdrCopy->Release(); g_hdrCopy = nullptr;
+        }
+    }
+    if (!g_hdrCopy) {
+        D3D11_TEXTURE2D_DESC cd = {d.Width, d.Height, 1, 1, d.Format, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+        if (SUCCEEDED(g_dev->CreateTexture2D(&cd, nullptr, &g_hdrCopy)) &&
+            FAILED(g_dev->CreateShaderResourceView(g_hdrCopy, nullptr, &g_hdrCopySRV))) {
+            g_hdrCopy->Release(); g_hdrCopy = nullptr;
+        }
+    }
+    ID3D11RenderTargetView* rtv = nullptr;
+    if (g_hdrCopy && SUCCEEDED(g_dev->CreateRenderTargetView(bb, nullptr, &rtv))) {
+        ID3D11DeviceContext* c = g_ctx;
+        g_inScenePass = g_inSnap = true;
+        c->CopyResource(g_hdrCopy, bb);
+        GameState st(c, true);
+        c->OMSetRenderTargets(1, &rtv, nullptr);
+        D3D11_VIEWPORT vp = {0, 0, (float)d.Width, (float)d.Height, 0, 1};
+        c->RSSetViewports(1, &vp);
+        DrawFullscreen(c, g_hdrPS, g_hdrCopySRV);
+        st.Restore(c);
+        g_inScenePass = g_inSnap = false;
+        rtv->Release();
+    }
+    bb->Release();
+}
+
+static DXGI_FORMAT TexFormat(ID3D11Resource* r, D3D11_TEXTURE2D_DESC* out = nullptr) {
+    ID3D11Texture2D* t = nullptr;
+    if (!r || FAILED(r->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&t))) return DXGI_FORMAT_UNKNOWN;
+    D3D11_TEXTURE2D_DESC d;
+    t->GetDesc(&d);
+    t->Release();
+    if (out) *out = d;
+    return d.Format;
+}
+
+// The game copying between its FP16 working image and an 8-bit texture would fail silently
+// (copies need matching formats), so same-size copies into a render target are redone as a draw.
+// Anything else is logged; the handoff notes say what to look for.
+static bool HdrCopyMismatch(ID3D11Resource* dst, ID3D11Resource* src) {
+    DXGI_FORMAT a = TexFormat(dst), b = TexFormat(src);
+    return a != b && a != DXGI_FORMAT_UNKNOWN && b != DXGI_FORMAT_UNKNOWN &&
+           (a == DXGI_FORMAT_R16G16B16A16_FLOAT || b == DXGI_FORMAT_R16G16B16A16_FLOAT);
+}
+
+static void LogCopyMismatch(const char* what, ID3D11Resource* dst, ID3D11Resource* src, bool fixed) {
+    static int n;
+    if (++n > 20) return;
+    D3D11_TEXTURE2D_DESC a, b;
+    TexFormat(dst, &a);
+    TexFormat(src, &b);
+    Log("HDR: game %s %ux%u fmt %u -> %ux%u fmt %u (bind %x, usage %u): %s", what, b.Width, b.Height, b.Format, a.Width,
+        a.Height, a.Format, a.BindFlags, a.Usage, fixed ? "redone as a draw" : "NOT handled, copy is lost");
+}
+
+static bool BlitCopy(ID3D11Resource* dst, ID3D11Resource* src) {
+    D3D11_TEXTURE2D_DESC a, b;
+    TexFormat(dst, &a);
+    TexFormat(src, &b);
+    if (a.Width != b.Width || a.Height != b.Height || !(a.BindFlags & D3D11_BIND_RENDER_TARGET) ||
+        !(b.BindFlags & D3D11_BIND_SHADER_RESOURCE))
+        return false;
+    LoadScenePass();
+    if (!g_blitPS) g_blitPS = CompilePS(kBlitPS, nullptr, "hdr_blit");
+    if (!g_fullscreenVS || !g_noDepth || !g_blitPS) return false;
+    ID3D11RenderTargetView* rtv = nullptr;
+    ID3D11ShaderResourceView* srv = nullptr;
+    bool ok = SUCCEEDED(g_dev->CreateRenderTargetView(dst, nullptr, &rtv)) && SUCCEEDED(g_dev->CreateShaderResourceView(src, nullptr, &srv));
+    if (ok) {
+        ID3D11DeviceContext* c = g_ctx;
+        g_inScenePass = g_inSnap = true;
+        GameState st(c, true);
+        c->OMSetRenderTargets(1, &rtv, nullptr);
+        D3D11_VIEWPORT vp = {0, 0, (float)a.Width, (float)a.Height, 0, 1};
+        c->RSSetViewports(1, &vp);
+        DrawFullscreen(c, g_blitPS, srv);
+        st.Restore(c);
+        g_inScenePass = g_inSnap = false;
+    }
+    if (rtv) rtv->Release();
+    if (srv) srv->Release();
+    return ok;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -813,7 +1105,20 @@ static HRESULT STDMETHODCALLTYPE H_Present(IDXGISwapChain* sc, UINT sync, UINT f
             if (!g_crtOn) { g_crtOn = true; SelectCrt(g_crtIdx, true); }  // first press from off just turns it on
             else SelectCrt(g_crtIdx + 1, true);
         }
-        if (f8 && !f8was) LoadCrt();
+        if (f8 && !f8was) {
+            if (g_hdr) LoadHdrConfig(false);
+            LoadCrt();
+            if (g_hdrActive) BuildHdrShader();
+        }
+        bool f6 = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
+        static bool f6was;
+        if (f6 && !f6was && g_hdrActive) {
+            g_hdrHighlights = !g_hdrHighlights;
+            Log("HDR: highlights %s", g_hdrHighlights ? "on" : "off (SDR filters, clipped at paper white)");
+            LoadCrt();
+            BuildHdrShader();
+        }
+        f6was = f6;
         if (f9 && !f9was) { g_crtOn = !g_crtOn; Log("CRT: %s", g_crtOn ? "on" : "off"); }
         f7was = f7;
         f8was = f8;
@@ -850,6 +1155,7 @@ static HRESULT STDMETHODCALLTYPE H_Present(IDXGISwapChain* sc, UINT sync, UINT f
             }
         }
 #endif
+        if (g_hdrActive) HdrPass(sc);
     }
     return o_Present(sc, sync, flags);
 }
@@ -863,24 +1169,77 @@ typedef HRESULT(STDMETHODCALLTYPE* PFN_CreateSCHwnd)(IDXGIFactory2*, IUnknown*, 
 static PFN_CreateSC o_CreateSC;
 static PFN_CreateSCHwnd o_CreateSCHwnd;
 
+typedef HRESULT(STDMETHODCALLTYPE* PFN_Resize)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
+static PFN_Resize o_Resize;
+
+static void SetColorSpace(IDXGISwapChain* sc) {
+    IDXGISwapChain3* sc3 = nullptr;
+    UINT support = 0;
+    g_hdrActive = SUCCEEDED(sc->QueryInterface(__uuidof(IDXGISwapChain3), (void**)&sc3)) &&
+                  SUCCEEDED(sc3->CheckColorSpaceSupport(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, &support)) &&
+                  (support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT) &&
+                  SUCCEEDED(sc3->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709));
+    if (sc3) sc3->Release();
+    Log(g_hdrActive ? "HDR: swap chain is scRGB (FP16, flip model)" : "HDR: scRGB colour space refused; output stays SDR");
+}
+
+static HRESULT STDMETHODCALLTYPE H_Resize(IDXGISwapChain* sc, UINT n, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags) {
+    if (g_hdrActive) {
+        if (fmt != DXGI_FORMAT_UNKNOWN) fmt = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        if (n == 1) n = 2;
+        flags &= ~DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE;
+    }
+    HRESULT hr = o_Resize(sc, n, w, h, fmt, flags);
+    Lock l;
+    if (FAILED(hr)) Log("HDR: ResizeBuffers %ux%u failed (%08lx)", w, h, hr);
+    else if (g_hdrActive) { SetColorSpace(sc); QueryDisplay(sc); BuildHdrShader(); }
+    return hr;
+}
+
 static void HookSwapChain(IDXGISwapChain* sc) {
     Lock l;
     void** vt = *(void***)sc;
     if (vt[8] != (void*)H_Present) Patch(&vt[8], H_Present, (void**)&o_Present);
+    if (g_hdr && vt[13] != (void*)H_Resize) Patch(&vt[13], H_Resize, (void**)&o_Resize);
     DXGI_SWAP_CHAIN_DESC d;
     if (SUCCEEDED(sc->GetDesc(&d)))
         Log("swapchain %ux%u fmt=%u buffers=%u windowed=%d swapeffect=%u", d.BufferDesc.Width, d.BufferDesc.Height,
             d.BufferDesc.Format, d.BufferCount, d.Windowed, d.SwapEffect);
 }
 
+// With HDR on, the swap chain is created as FP16 flip-model instead of what the game asked for.
 static HRESULT STDMETHODCALLTYPE H_CreateSC(IDXGIFactory* f, IUnknown* dev, DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** out) {
-    HRESULT hr = o_CreateSC(f, dev, desc, out);
+    HRESULT hr = E_FAIL;
+    if (g_hdr && desc) {
+        DXGI_SWAP_CHAIN_DESC hd = *desc;
+        hd.BufferDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        hd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        hd.BufferCount = std::max(2u, hd.BufferCount);
+        hd.SampleDesc = {1, 0};
+        hd.Flags &= ~DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE;
+        hr = o_CreateSC(f, dev, &hd, out);
+        if (SUCCEEDED(hr) && out && *out) { Lock l; SetColorSpace(*out); }
+        else Log("HDR: couldn't create an HDR swap chain (%08lx); output stays SDR", hr);
+    }
+    if (FAILED(hr)) hr = o_CreateSC(f, dev, desc, out);
     if (SUCCEEDED(hr) && out && *out) HookSwapChain(*out);
     return hr;
 }
 static HRESULT STDMETHODCALLTYPE H_CreateSCHwnd(IDXGIFactory2* f, IUnknown* dev, HWND w, const DXGI_SWAP_CHAIN_DESC1* d,
                                                 const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fs, IDXGIOutput* o, IDXGISwapChain1** out) {
-    HRESULT hr = o_CreateSCHwnd(f, dev, w, d, fs, o, out);
+    HRESULT hr = E_FAIL;
+    if (g_hdr && d) {
+        DXGI_SWAP_CHAIN_DESC1 hd = *d;
+        hd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        hd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        hd.BufferCount = std::max(2u, hd.BufferCount);
+        hd.SampleDesc = {1, 0};
+        hd.Flags &= ~DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE;
+        hr = o_CreateSCHwnd(f, dev, w, &hd, fs, o, out);
+        if (SUCCEEDED(hr) && out && *out) { Lock l; SetColorSpace(*out); }
+        else Log("HDR: couldn't create an HDR swap chain (%08lx); output stays SDR", hr);
+    }
+    if (FAILED(hr)) hr = o_CreateSCHwnd(f, dev, w, d, fs, o, out);
     if (SUCCEEDED(hr) && out && *out) HookSwapChain(*out);
     return hr;
 }
@@ -905,6 +1264,132 @@ static void HookFactory(ID3D11Device* dev) {
     if (ad) ad->Release();
     if (dd) dd->Release();
 }
+
+#ifndef CRT_RELEASE
+// ---------------------------------------------------------------------------------------------
+// Texture dumps: every texture the game uploads with pixel data goes to shaderlog\textures\,
+// named by a hash of its contents so repeats are skipped. 32-bit formats are written as BMP,
+// anything else as raw bytes with the format in the name. textures\index.txt lists each upload.
+
+static std::unordered_map<uint64_t, bool> g_dumpedTex;
+static std::unordered_map<void*, int> g_texUpdates;  // per-texture UpdateSubresource dumps, capped (video)
+
+static UINT BitsPerPixel(DXGI_FORMAT f) {
+    switch (f) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: case DXGI_FORMAT_R8G8B8A8_UINT:
+    case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: case DXGI_FORMAT_B8G8R8X8_UNORM:
+    case DXGI_FORMAT_R10G10B10A2_UNORM: case DXGI_FORMAT_R32_FLOAT: case DXGI_FORMAT_R32_UINT: return 32;
+    case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_R16_UNORM: case DXGI_FORMAT_R16_UINT: case DXGI_FORMAT_R16_FLOAT:
+    case DXGI_FORMAT_B5G6R5_UNORM: case DXGI_FORMAT_B5G5R5A1_UNORM: case DXGI_FORMAT_B4G4R4A4_UNORM: return 16;
+    case DXGI_FORMAT_R8_UNORM: case DXGI_FORMAT_R8_UINT: case DXGI_FORMAT_A8_UNORM: return 8;
+    case DXGI_FORMAT_BC1_UNORM: case DXGI_FORMAT_BC1_UNORM_SRGB: case DXGI_FORMAT_BC4_UNORM: return 4;  // per pixel, 4x4 blocks
+    case DXGI_FORMAT_BC2_UNORM: case DXGI_FORMAT_BC2_UNORM_SRGB: case DXGI_FORMAT_BC3_UNORM: case DXGI_FORMAT_BC3_UNORM_SRGB:
+    case DXGI_FORMAT_BC5_UNORM: case DXGI_FORMAT_BC7_UNORM: case DXGI_FORMAT_BC7_UNORM_SRGB: return 8;
+    default: return 0;
+    }
+}
+static bool IsBC(DXGI_FORMAT f) { return f >= DXGI_FORMAT_BC1_TYPELESS && f <= DXGI_FORMAT_BC5_SNORM || f >= DXGI_FORMAT_BC6H_TYPELESS && f <= DXGI_FORMAT_BC7_UNORM_SRGB; }
+
+// Writes w x h pixels starting at `p` (rows `pitch` apart). `how` says where it came from.
+static void DumpPixels(const void* p, UINT pitch, UINT w, UINT h, DXGI_FORMAT fmt, const char* how) {
+    UINT bpp = BitsPerPixel(fmt);
+    if (!p || !bpp || w < 8 || h < 8) return;
+    bool bc = IsBC(fmt);
+    UINT rows = bc ? (h + 3) / 4 : h, rowBytes = bc ? (w + 3) / 4 * bpp * 2 : w * bpp / 8;
+    uint64_t hash = Fnv(&fmt, sizeof fmt);
+    for (UINT y = 0; y < rows; y++) hash = Fnv((const uint8_t*)p + (size_t)y * pitch, rowBytes, hash);
+    if (g_dumpedTex[hash]) return;
+    g_dumpedTex[hash] = true;
+    std::string dir = g_root + "textures\\";
+    CreateDirectoryA(dir.c_str(), nullptr);
+    char name[96];
+    bool bgra = fmt == DXGI_FORMAT_B8G8R8A8_UNORM || fmt == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || fmt == DXGI_FORMAT_B8G8R8X8_UNORM;
+    bool rgba = fmt == DXGI_FORMAT_R8G8B8A8_UNORM || fmt == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || fmt == DXGI_FORMAT_R8G8B8A8_UINT;
+    sprintf_s(name, "%s_%ux%u_f%u.%s", Hex(hash).c_str(), w, h, fmt, bgra || rgba ? "bmp" : "raw");
+    if (FILE* f = fopen((dir + name).c_str(), "wb")) {
+        if (bgra || rgba) {  // 32-bit top-down BMP, BGRA
+            uint8_t hd[54] = {'B', 'M'};
+            *(uint32_t*)(hd + 2) = 54 + w * 4 * h;
+            *(uint32_t*)(hd + 10) = 54;
+            *(uint32_t*)(hd + 14) = 40;
+            *(int32_t*)(hd + 18) = w;
+            *(int32_t*)(hd + 22) = -(int32_t)h;
+            *(uint16_t*)(hd + 26) = 1;
+            *(uint16_t*)(hd + 28) = 32;
+            *(uint32_t*)(hd + 34) = w * 4 * h;
+            fwrite(hd, 1, 54, f);
+        }
+        std::string line(rowBytes, '\0');
+        for (UINT y = 0; y < rows; y++) {
+            memcpy(&line[0], (const uint8_t*)p + (size_t)y * pitch, rowBytes);
+            if (rgba) for (UINT x = 0; x < rowBytes; x += 4) std::swap(line[x], line[x + 2]);
+            fwrite(line.data(), 1, rowBytes, f);
+        }
+        fclose(f);
+    }
+    if (FILE* f = fopen((dir + "index.txt").c_str(), "ab")) {
+        fprintf(f, "%9.3fs %-44s %s\r\n", (GetTickCount() - g_t0) / 1000.0, name, how);
+        fclose(f);
+    }
+}
+
+static void STDMETHODCALLTYPE H_UpdateSub(ID3D11DeviceContext* c, ID3D11Resource* dst, UINT sub, const D3D11_BOX* box, const void* data, UINT pitch, UINT depthPitch) {
+    o_UpdateSub(c, dst, sub, box, data, pitch, depthPitch);
+    Lock l;
+    ID3D11Texture2D* t = nullptr;
+    if (sub == 0 && dst && SUCCEEDED(dst->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&t))) {
+        D3D11_TEXTURE2D_DESC d;
+        t->GetDesc(&d);
+        t->Release();
+        UINT w = box ? box->right - box->left : d.Width, h = box ? box->bottom - box->top : d.Height;
+        if (w >= 32 && h >= 32 && g_texUpdates[dst]++ < 4) {
+            char how[96];
+            sprintf_s(how, "UpdateSubresource into %ux%u at %u,%u", d.Width, d.Height, box ? box->left : 0, box ? box->top : 0);
+            DumpPixels(data, pitch, w, h, d.Format, how);
+        }
+    }
+    Repatch();
+}
+
+// Sheets the game fills some other way (staging copies, Map) are read back the first time a
+// pixel shader samples them.
+static std::unordered_map<void*, bool> g_readTex;
+static void DumpOnFirstUse(ID3D11Resource* res, UINT slot) {
+    if (!res || !g_ctx || g_readTex[res]) return;
+    g_readTex[res] = true;
+    ID3D11Texture2D* tex = nullptr;
+    if (FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex))) return;
+    D3D11_TEXTURE2D_DESC d;
+    tex->GetDesc(&d);
+    if (d.BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL) || d.SampleDesc.Count > 1 || !BitsPerPixel(d.Format)) {
+        tex->Release();
+        return;
+    }
+    ID3D11Device* dev = nullptr;
+    g_ctx->GetDevice(&dev);
+    D3D11_TEXTURE2D_DESC sd = d;
+    sd.MipLevels = sd.ArraySize = 1;
+    sd.Usage = D3D11_USAGE_STAGING;
+    sd.BindFlags = sd.MiscFlags = 0;
+    sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ID3D11Texture2D* st = nullptr;
+    if (dev && SUCCEEDED(dev->CreateTexture2D(&sd, nullptr, &st))) {
+        g_inSnap = true;
+        g_ctx->CopySubresourceRegion(st, 0, 0, 0, 0, tex, 0, nullptr);
+        D3D11_MAPPED_SUBRESOURCE m;
+        if (SUCCEEDED(g_ctx->Map(st, 0, D3D11_MAP_READ, 0, &m))) {
+            char how[96];
+            sprintf_s(how, "first use, PS slot %u, usage %u, %u mips, %u slices", slot, d.Usage, d.MipLevels, d.ArraySize);
+            DumpPixels(m.pData, m.RowPitch, d.Width, d.Height, d.Format, how);
+            g_ctx->Unmap(st, 0);
+        }
+        g_inSnap = false;
+        st->Release();
+    }
+    if (dev) dev->Release();
+    tex->Release();
+}
+#endif
 
 // ---------------------------------------------------------------------------------------------
 // ID3D11Device hooks
@@ -934,10 +1419,38 @@ static HRESULT STDMETHODCALLTYPE H_CreatePS(ID3D11Device* d, const void* code, S
     }
     return hr;
 }
+// HDR: the game's full-size 8-bit render targets (the 1080p working image and its scratch copies)
+// are made FP16, so the filter's output above 1.0 isn't clipped before the final pass.
+static bool Is8BitRGBA(DXGI_FORMAT f) {
+    return f == DXGI_FORMAT_R8G8B8A8_UNORM || f == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || f == DXGI_FORMAT_R8G8B8A8_TYPELESS ||
+           f == DXGI_FORMAT_B8G8R8A8_UNORM || f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || f == DXGI_FORMAT_B8G8R8A8_TYPELESS;
+}
+
 static HRESULT STDMETHODCALLTYPE H_CreateTex2D(ID3D11Device* d, const D3D11_TEXTURE2D_DESC* desc, const D3D11_SUBRESOURCE_DATA* init, ID3D11Texture2D** out) {
+    D3D11_TEXTURE2D_DESC up;
+    if (g_hdr && desc && !init && (desc->BindFlags & D3D11_BIND_RENDER_TARGET) && desc->Width >= 1280 &&
+        desc->SampleDesc.Count == 1 && (desc->Format == DXGI_FORMAT_B8G8R8A8_UNORM || desc->Format == DXGI_FORMAT_R8G8B8A8_UNORM)) {
+        up = *desc;
+        up.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        desc = &up;
+        Lock l;
+        Log("HDR: render target %ux%u made FP16", up.Width, up.Height);
+    }
     HRESULT hr = o_CreateTex2D(d, desc, init, out);
     if (SUCCEEDED(hr) && out && *out) { Lock l; g_texScene.erase(*out); }  // address may be reused
 #ifndef CRT_RELEASE
+    if (SUCCEEDED(hr) && out && *out) { Lock l; g_readTex.erase(*out); }
+#endif
+#ifndef CRT_RELEASE
+    if (SUCCEEDED(hr) && desc && init && !(desc->BindFlags & D3D11_BIND_RENDER_TARGET)) {
+        Lock l;
+        UINT mips = desc->MipLevels ? desc->MipLevels : 1;
+        for (UINT a = 0; a < desc->ArraySize; a++) {
+            char how[96];
+            sprintf_s(how, "created, slice %u/%u, %u mips, usage %u", a, desc->ArraySize, mips, desc->Usage);
+            DumpPixels(init[a * mips].pSysMem, init[a * mips].SysMemPitch, desc->Width, desc->Height, desc->Format, how);
+        }
+    }
     if (SUCCEEDED(hr) && desc && (desc->BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL))) {
         Lock l;
         Log("rendertarget %s %ux%u fmt=%u bind=%x msaa=%u", out && *out ? ResDesc(*out).c_str() : "?", desc->Width,
@@ -947,12 +1460,42 @@ static HRESULT STDMETHODCALLTYPE H_CreateTex2D(ID3D11Device* d, const D3D11_TEXT
     return hr;
 }
 
+// Views the game creates with an explicit 8-bit format would fail on an FP16 texture.
+typedef HRESULT(STDMETHODCALLTYPE* PFN_CreateSRV)(ID3D11Device*, ID3D11Resource*, const D3D11_SHADER_RESOURCE_VIEW_DESC*, ID3D11ShaderResourceView**);
+typedef HRESULT(STDMETHODCALLTYPE* PFN_CreateRTV)(ID3D11Device*, ID3D11Resource*, const D3D11_RENDER_TARGET_VIEW_DESC*, ID3D11RenderTargetView**);
+static PFN_CreateSRV o_CreateSRV;
+static PFN_CreateRTV o_CreateRTV;
+
+static HRESULT STDMETHODCALLTYPE H_CreateSRV(ID3D11Device* d, ID3D11Resource* r, const D3D11_SHADER_RESOURCE_VIEW_DESC* desc, ID3D11ShaderResourceView** out) {
+    D3D11_SHADER_RESOURCE_VIEW_DESC fixed;
+    if (desc && Is8BitRGBA(desc->Format) && TexFormat(r) == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+        fixed = *desc;
+        fixed.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        desc = &fixed;
+    }
+    return o_CreateSRV(d, r, desc, out);
+}
+static HRESULT STDMETHODCALLTYPE H_CreateRTV(ID3D11Device* d, ID3D11Resource* r, const D3D11_RENDER_TARGET_VIEW_DESC* desc, ID3D11RenderTargetView** out) {
+    D3D11_RENDER_TARGET_VIEW_DESC fixed;
+    if (desc && Is8BitRGBA(desc->Format) && TexFormat(r) == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+        fixed = *desc;
+        fixed.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        desc = &fixed;
+    }
+    return o_CreateRTV(d, r, desc, out);
+}
+
 static void HookDevice(ID3D11Device* dev) {
     static bool done;
     if (done) return;
     done = true;
+    g_dev = dev;
     void** vt = *(void***)dev;
     Patch(&vt[5], H_CreateTex2D, (void**)&o_CreateTex2D);
+    if (g_hdr) {
+        Patch(&vt[7], H_CreateSRV, (void**)&o_CreateSRV);
+        Patch(&vt[9], H_CreateRTV, (void**)&o_CreateRTV);
+    }
 #ifndef CRT_RELEASE
     Patch(&vt[12], H_CreateVS, (void**)&o_CreateVS);
 #endif
@@ -1055,6 +1598,7 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
         g_snapDraws = strcmp(arm, "draws") == 0;  // SHADERLOG_ARM=draws behaves like Shift+F11
     }
 #endif
+    LoadHdrConfig(true);
     if (const char* t = getenv("SHADERLOG_CRT_TARGET")) g_copyBackPS = t;  // test hook: swap a different shader
     // game.exe's imports are already bound by the time our DllMain runs, so these patches stick.
     PatchImport("d3d11.dll", "D3D11CreateDevice", H_CreateDevice, (void**)&o_CreateDevice);

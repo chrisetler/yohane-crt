@@ -12,7 +12,8 @@
 // (marked below). Only mask_type 1 (the default) is included.
 //
 // F7 cycles shaders, F8 reloads after an edit, F9 toggles the filter. Settings are the
-// "static const" values below the adapter.
+// "static const" values below the adapter. With HDR on (crt\hdr.ini) the mod compiles this
+// with CRT_HDR and CRT_HDR_BOOST defined.
 //
 // The body below the adapter matches crt/compare/crt-geom.hlsl in the yohane-crt project.
 
@@ -73,7 +74,11 @@ static const float cornersize = 0.03;
 static const float cornersmooth = 1000.0;
 static const float overscan_x = 100.0;
 static const float overscan_y = 100.0;
+#ifdef CRT_HDR
+static const float DOTMASK = 0.3;       // HDR (crt\hdr.ini): the shipped mask strength
+#else
 static const float DOTMASK = 0.2;       // shipped 0.3; mask strength
+#endif
 static const float DOTMASK_brightboost = 0.0;
 static const float SHARPER = 1.0;
 static const float scanline_weight = 0.3;
@@ -154,6 +159,9 @@ float4 geom_main(PSIn i) {
     vec3 chi = (ifbright * aperture_average) * mul_res - (ifbright - 1.0) * clow;
     vec3 cout = mix(clow, chi, maskw);
 
+#ifdef CRT_HDR
+    cout *= CRT_HDR_BOOST;  // HDR: beams can go past paper white (hdr.ini crt_boost)
+#endif
     return float4(pow(max(cout, 0.0), 1.0 / monitorgamma), 1.0);
 }
 

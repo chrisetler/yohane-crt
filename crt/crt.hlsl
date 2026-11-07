@@ -26,8 +26,12 @@
 #define BEAM_BRIGHT       0.50   // beam thickness for bright pixels (bright lines bloom wider)
 #define SHARPNESS         0.4   // horizontal softness, in virtual pixels (lower = sharper)
 #define BRIGHTNESS        1.30   // compensates for the light lost in the scanline gaps
+#ifdef CRT_HDR
+#define MASK_STRENGTH     0.25   // HDR (crt\hdr.ini): the extra brightness pays for a stronger mask
+#else
 #define MASK_STRENGTH     0.10   // aperture-grille RGB stripes; 0 = off. Keep low: the image
                                  // is rescaled 1.33x to a 1440p window, so strong masks moire
+#endif
 #define CURVATURE         0.00   // barrel distortion; try 0.03-0.06. Corners go black.
 #define GAMMA             2.2
 
@@ -114,5 +118,10 @@ float4 main(PSIn i) : SV_Target {
     }
 
     float alpha = tex_sampler_WorkRTT.Load(int3(i.pos.xy, 0)).a;
+#ifdef CRT_HDR
+    // HDR: no clip at white, and beams can go past paper white by CRT_HDR_BOOST (set in hdr.ini)
+    return float4(pow(max(col, 0.0) * CRT_HDR_BOOST, 1.0 / GAMMA), alpha);
+#else
     return float4(pow(saturate(col), 1.0 / GAMMA), alpha);
+#endif
 }
