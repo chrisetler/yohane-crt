@@ -365,6 +365,10 @@ static float g_paperWhite = 200.0f;   // nits for SDR white (HUD, menus, cutscen
 static float g_peak;                  // nits; 0 = what the display reports
 static float g_crtBoost = 1.5f;       // linear gain on the filter's output
 static float g_displayPeak;           // reported by the display; 0 = unknown
+// Set when the CRT filter draws (level copy-back or a scene pass); cleared each Present. On frames
+// without it (pause page, menus, F9 off) nothing should be above paper white, but some of the
+// game's own UI draws go past 1.0 (clipped in 8-bit, kept in FP16), so those frames are clipped.
+static bool g_crtThisFrame;
 
 static float HdrPeak() { return g_peak > 0 ? g_peak : g_displayPeak > 0 ? g_displayPeak : 1000.0f; }
 
@@ -562,6 +566,7 @@ static void STDMETHODCALLTYPE H_PSSetSRV(ID3D11DeviceContext* c, UINT start, UIN
 static void STDMETHODCALLTYPE H_SetPS(ID3D11DeviceContext* c, ID3D11PixelShader* s, ID3D11ClassInstance* const* ci, UINT n) {
     bool crt = s && s == g_copyPS && g_crtOn && g_crtPS;
     o_SetPS(c, crt ? g_crtPS : s, ci, n);
+    if (crt) g_crtThisFrame = true;
     Lock l;
     Repatch();
     if (!g_cap) return;
@@ -875,6 +880,7 @@ static void RunScenePass(ID3D11Resource* target) {
 
     GameState st(c, false);
     DrawFullscreen(c, g_crtPS, g_sceneCopySRV);  // the filter over the whole target
+    g_crtThisFrame = true;
     st.Restore(c);
     g_inScenePass = g_inSnap = false;
 }
@@ -917,6 +923,7 @@ float4 main(float4 pos : SV_Position) : SV_Target {
 static const char* kBlitPS = "Texture2D t:register(t0);float4 main(float4 p:SV_Position):SV_Target{return t.Load(int3(p.xy,0));}";
 
 static ID3D11PixelShader* g_hdrPS;
+static ID3D11PixelShader* g_hdrPSClip;  // HIGHLIGHTS 0, for frames the filter didn't draw
 static ID3D11PixelShader* g_blitPS;
 static ID3D11Texture2D* g_hdrCopy;
 static ID3D11ShaderResourceView* g_hdrCopySRV;
@@ -938,11 +945,14 @@ static ID3D11PixelShader* CompilePS(const char* src, const D3D_SHADER_MACRO* def
 static void BuildHdrShader() {
     if (!g_dev) return;
     if (g_hdrPS) { g_hdrPS->Release(); g_hdrPS = nullptr; }
+    if (g_hdrPSClip) { g_hdrPSClip->Release(); g_hdrPSClip = nullptr; }
     char paper[32], peak[32];
     sprintf_s(paper, "%f", g_paperWhite / 80.0f);
     sprintf_s(peak, "%f", HdrPeak() / g_paperWhite);
     D3D_SHADER_MACRO d[] = {{"PAPER", paper}, {"PEAK_REL", peak}, {"HIGHLIGHTS", g_hdrHighlights ? "1" : "0"}, {nullptr, nullptr}};
     g_hdrPS = CompilePS(kHdrPS, d, "hdr_output");
+    d[2].Definition = "0";
+    g_hdrPSClip = CompilePS(kHdrPS, d, "hdr_output_clip");
 }
 
 static void QueryDisplay(IDXGISwapChain* sc) {
@@ -973,7 +983,15 @@ static void HdrPass(IDXGISwapChain* sc) {
         QueryDisplay(sc);
         BuildHdrShader();
     }
-    if (!g_fullscreenVS || !g_noDepth || !g_hdrPS) return;
+    bool filtered = g_crtThisFrame;
+    g_crtThisFrame = false;
+    static int lastFiltered = -1;
+    if ((int)filtered != lastFiltered) {
+        lastFiltered = filtered;
+        Log("HDR: %s", filtered ? "filter drawing, highlights allowed" : "no filter this frame, clipped at paper white");
+    }
+    ID3D11PixelShader* ps = filtered ? g_hdrPS : g_hdrPSClip;
+    if (!g_fullscreenVS || !g_noDepth || !ps) return;
     ID3D11Texture2D* bb = nullptr;
     if (FAILED(sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&bb))) return;
     D3D11_TEXTURE2D_DESC d;
@@ -1002,7 +1020,7 @@ static void HdrPass(IDXGISwapChain* sc) {
         c->OMSetRenderTargets(1, &rtv, nullptr);
         D3D11_VIEWPORT vp = {0, 0, (float)d.Width, (float)d.Height, 0, 1};
         c->RSSetViewports(1, &vp);
-        DrawFullscreen(c, g_hdrPS, g_hdrCopySRV);
+        DrawFullscreen(c, ps, g_hdrCopySRV);
         st.Restore(c);
         g_inScenePass = g_inSnap = false;
         rtv->Release();
