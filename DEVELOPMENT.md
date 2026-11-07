@@ -168,6 +168,13 @@ in-game adapter. `crtcompare.cpp` runs one over a BMP at any output size:
 
 Make the 480x270 input from an F11 snapshot with ffmpeg: `-vf scale=480:270:flags=area -pix_fmt bgra`.
 
+## Testing
+
+`tests/` holds two WARP harnesses that load the DLL the same way the game does: one for the level
+path, one for the parlor scene pass. Run both after any change to the hooks.
+[tests/README.md](tests/README.md) has the build commands, the environment settings that point the
+filter at the harness's shaders, and the expected output.
+
 ## Packaging
 
 `package.ps1` runs the build and assembles `dist\YohaneCRT-<version>.zip`: the release DLL, the
@@ -175,4 +182,41 @@ two filters, `YohaneCRT-README.txt` (from `dist-readme.txt`, with the version, U
 filled in), `YohaneCRT-LICENSE.txt` and the full source in `YohaneCRT-source\`. It also writes
 `dist\SHA256SUMS.txt`. The version comes from `CRT_VERSION` in `shaderlog.cpp`.
 
-    powershell -ExecutionPolicy Bypass -File package.ps1 -Url https://github.com/<you>/<repo>
+    powershell -ExecutionPolicy Bypass -File package.ps1 -Url https://github.com/chrisetler/yohane-crt
+
+The DLL's hash changes on every build, so always publish the zip and `SHA256SUMS.txt` from the
+same run.
+
+## Releasing
+
+Where the mod is published:
+
+| Place | Link | Notes |
+|---|---|---|
+| GitHub | https://github.com/chrisetler/yohane-crt | Source and releases (v1.0.0 on 2026-11-07) |
+| Nexus Mods | game id 10985 | The game was added to Nexus by this mod's upload; it was awaiting admin approval as of 2026-11-07. The header banner is `screenshots/nexus-banner.png` (1300x372) |
+| PCGamingWiki | [Yohane the Parhelion: Blaze in the Deepblue](https://www.pcgamingwiki.com/wiki/Yohane_the_Parhelion:_Blaze_in_the_Deepblue) | A `===Yohane CRT===` entry under *Other information*, after *Middleware*, with an install `Fixbox` |
+
+For a new version:
+
+1. Bump `CRT_VERSION` in `shaderlog/shaderlog.cpp` and update the tested Steam build in
+   `README.md` and `dist-readme.txt` if it changed. The current build ID is in
+   `steamapps/appmanifest_2404370.acf`.
+2. Run the harnesses (see Testing), then test the release DLL in the game: F7, F9, a level and the
+   parlor.
+3. Commit and push.
+4. Run `package.ps1 -Url https://github.com/chrisetler/yohane-crt`.
+5. `gh release create v<version> dist/YohaneCRT-<version>.zip dist/SHA256SUMS.txt --title "Yohane CRT <version>"`
+   with notes covering what changed, install and the DLL hash. Then download the zip back and
+   check its hash against `SHA256SUMS.txt`.
+6. Upload the same zip to Nexus as a new file version, and update the PCGamingWiki entry if the
+   install steps changed.
+
+This folder is on a network share, so git needs a `safe.directory` entry for it (already in the
+global git config on the dev PC). Commits use the GitHub no-reply address, set in this repo's
+local config.
+
+**If a game update breaks it:** the release log says the copy-back shader never appeared. Install
+the diagnostic build, take F10/F11 captures in a level, and find the new hash of the copy-back
+shader (the full-screen draw after the water pass, before the glow chain). Update `g_copyBackPS`.
+Check the parlor fingerprint too, with a Shift+F11 capture there.

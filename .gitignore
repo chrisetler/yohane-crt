@@ -5,3 +5,6 @@
 *.lib
 *.exe
 dist/
+
+# game art from captures (e.g. tests/atlas.bmp)
+*.bmp
