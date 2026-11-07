@@ -1,0 +1,4 @@
+LIBRARY D3DCOMPILER_43
+EXPORTS
+    D3DCompile = Proxy_D3DCompile
+    D3DReflect = Proxy_D3DReflect
