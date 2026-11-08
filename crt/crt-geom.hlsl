@@ -80,8 +80,9 @@ static const float DOTMASK_brightboost = 0.0;
 static const float SHARPER = 1.0;
 #ifdef CRT_HDR
 static const float scanline_weight = 0.25;  // HDR: thinner beams, near-black gaps between lines
-static const float bright_bloom = 0.10;     // HDR: bright beams widen by this much (in lines), filling the
-                                            // gaps on near-white areas the way a real tube blooms
+static const float bright_bloom = 0.05;     // HDR: bright beams widen by this much (in lines), filling the
+                                            // gaps on near-white areas a little (white dips to ~30% between
+                                            // lines, like SDR); the game's glow fills some of the rest
 // HDR: each beam is scaled by 0.3 / its width, so every shade keeps the SDR filter's average
 // brightness: thin beams get brighter peaks instead of a dimmer picture, and bloomed white beams
 // don't get extra. Overall level is crt_boost in hdr.ini.
