@@ -358,6 +358,9 @@ static bool ReadText(const std::string& path, std::string& out) {
 // unclipped. A last pass before Present turns the game's gamma-encoded SDR values into light
 // (1.0 = paper white) and, where the screen still shows what the filter drew, adds back the part
 // of the layer above 1.0, mapped through the game's final scale and rolled off toward the peak.
+// It also gives back glow the game added on top of a beam that its 8-bit image clipped, from a fit
+// of screen to filter over the nearby rows (without it, pastel areas wash out toward white on the
+// beam rows); the same fit tells covered beams (portraits, text) from glowing ones.
 // F6 switches highlights off: filters built as for SDR and the output clipped at paper white.
 
 static bool g_hdr;                    // hdr.ini says enabled
@@ -1017,9 +1020,11 @@ void Fetch(float2 uv, out float3 E, out float3 C) {
     }
 }
 #endif
+float Min3(float3 v) { return min(v.r, min(v.g, v.b)); }
 float4 main(float4 pos : SV_Position) : SV_Target {
     // the game's values are gamma-encoded for an SDR screen; 1.0 = paper white
-    float3 x = pow(max(Img.Load(int3(pos.xy, 0)).rgb, 0.0), 2.2);
+    float3 X = max(Img.Load(int3(pos.xy, 0)).rgb, 0.0);
+    float3 x = pow(X, 2.2);
 #if HIGHLIGHTS
     float2 uv = (pos.xy - vp.xy) * vp.zw;
     if (all(uv > 0.0) && all(uv < 1.0)) {
@@ -1027,19 +1032,55 @@ float4 main(float4 pos : SV_Position) : SV_Target {
         Fetch(uv, E, C);
         float3 e = pow(E, 2.2), c = pow(C, 2.2);  // unclipped filter output, and what the game kept
         float3 extra = e - c;
-        if (any(extra > 0.0)) {
-            // t: how much of the filter's light still reaches the screen. Whatever the game drew
-            // on top (a fade, fog, a dark panel) can only have dimmed each channel by at least
-            // that much, so the smallest screen/filter ratio over the channels the filter lit is a
-            // safe estimate; a pure glow leaves it at 1.
-            float3 r = c > 0.05 ? x / max(c, 1e-4) : 1.0;
-            float t = saturate(min(r.r, min(r.g, r.b)));
-            // what was added on top that the surviving filter light doesn't explain: a little is
-            // glow or fog colour; a lot means something bright and opaque (text) covers the beam,
-            // so fade the highlight out smoothly (kept up to +0.35, gone at +1.0)
-            float3 over = max(x - t * c, 0.0);
-            float vis = saturate((1.0 - max(over.r, max(over.g, over.b))) / 0.65);
-            x += t * vis * extra;
+        if (any(extra > 0.0) || any(X > 0.9)) {
+            // Fit the screen to the filter over the nearby rows (about a scanline), in the game's
+            // encoded values where its blends happen: screen = T * filter + g per channel. T is how
+            // much of the filter still shows (1 under glow, less under fog or a fade, 0 under an
+            // opaque portrait or text, whose shape doesn't follow the beams); g is what the game
+            // added on top, which is smooth. Samples where the screen or the filter clipped carry
+            // no information and are left out. The fit then says what this pixel would have been
+            // without the 8-bit clip: the filter's beam above white, plus glow the game added on a
+            // beam that was already white (lost on the beam rows, kept in the gaps: without it,
+            // pastels wash out toward white, as in Coral Hill).
+            float3 sx = 0.0, sc = 0.0, sxc = 0.0, scc = 0.0, n = 0.0;
+            [unroll] for (int k = -4; k <= 4; k++) {
+                float2 p = pos.xy + float2(0.0, k);
+                float2 uvs = (p - vp.xy) * vp.zw;
+                if (all(uvs > 0.0) && all(uvs < 1.0)) {
+                    float3 Xs = X, Es, Cs = C;
+                    if (k != 0) {
+                        Xs = max(Img.Load(int3(p, 0)).rgb, 0.0);
+                        Fetch(uvs, Es, Cs);
+                    }
+                    float3 ok = (Xs < 0.97 ? 1.0 : 0.0) * (Cs < 0.999 ? 1.0 : 0.0);
+                    sx += ok * Xs; sc += ok * Cs; sxc += ok * Xs * Cs; scc += ok * Cs * Cs; n += ok;
+                }
+            }
+            float3 nn = max(n, 1.0), use = n >= 4.0 ? 1.0 : 0.0;
+            float3 cov = sxc - sx * sc / nn, var = scc - sc * sc / nn;
+            float vt = dot(var * use, 1.0);
+            if (vt >= 0.018) {
+                float T = saturate(dot(cov * use, 1.0) / vt);
+                float3 g = (sx - T * sc) / nn;
+                // a channel clipped on every nearby row (red on a pink already at white) can't be
+                // measured; give it the smallest g the other channels show
+                g = saturate(use > 0.0 ? g : Min3(use > 0.0 ? g : 9.0));
+                x += max(pow(max(T * E + g, 0.0), 2.2) - pow(saturate(T * C + g), 2.2), 0.0);
+            } else {
+                // No beam structure to fit (a solid white area: everything clipped). t: how much
+                // of the filter's light still reaches the screen. Whatever the game drew on top
+                // can only have dimmed each channel by at least that much, so the smallest
+                // screen/filter ratio over the channels the filter lit is a safe estimate; a pure
+                // glow leaves it at 1. What was added on top that the surviving filter light
+                // doesn't explain: a little is glow or fog colour; a lot means something bright
+                // and opaque (text) covers the beam, so fade the highlight out smoothly (kept up
+                // to +0.35, gone at +1.0).
+                float3 r = c > 0.05 ? x / max(c, 1e-4) : 1.0;
+                float t = saturate(Min3(r));
+                float3 over = max(x - t * c, 0.0);
+                float vis = saturate((1.0 - max(over.r, max(over.g, over.b))) / 0.65);
+                x += t * vis * extra;
+            }
         }
     }
     float h = PEAK_REL - 1.0;  // headroom above paper white; roll off smoothly into it
