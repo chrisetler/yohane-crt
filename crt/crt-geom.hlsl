@@ -80,10 +80,16 @@ static const float DOTMASK_brightboost = 0.0;
 static const float SHARPER = 1.0;
 #ifdef CRT_HDR
 static const float scanline_weight = 0.25;  // HDR: thinner beams, near-black gaps between lines
-static const float scan_gain = 1.2;         // HDR: the light lost in the gaps, put back into the beams
+static const float bright_bloom = 0.10;     // HDR: bright beams widen by this much (in lines), filling the
+                                            // gaps on near-white areas the way a real tube blooms
+// HDR: each beam is scaled by 0.3 / its width, so every shade keeps the SDR filter's average
+// brightness: thin beams get brighter peaks instead of a dimmer picture, and bloomed white beams
+// don't get extra. Overall level is crt_boost in hdr.ini.
 #else
 static const float scanline_weight = 0.3;
+static const float bright_bloom = 0.0;
 #endif
+static const float sdr_scanline_weight = 0.3;  // the reference width the HDR beams are normalised to
 static const float lum = 0.3;           // shipped 0.0; scanline beam brightness
 static const float interlace_detect = 1.0;
 
@@ -95,8 +101,9 @@ static const vec2 aspect = vec2(1.0, 0.75);
 
 vec4 scanlineWeights(float distance, vec4 color) {
     vec4 wid = 2.0 + 2.0 * pow(color, 4.0);
-    vec4 weights = distance / scanline_weight;
-    return (lum + 1.4) * exp(-pow(weights * inversesqrt(0.5 * wid), wid)) / (0.6 + 0.2 * wid);
+    vec4 sw = scanline_weight + bright_bloom * color * color;
+    vec4 weights = distance / sw;
+    return (lum + 1.4) * exp(-pow(weights * inversesqrt(0.5 * wid), wid)) / (0.6 + 0.2 * wid) * (sdr_scanline_weight / sw);
 }
 
 float corner(vec2 coord) {
@@ -162,7 +169,7 @@ float4 geom_main(PSIn i) {
     vec3 cout = mix(clow, chi, maskw);
 
 #ifdef CRT_HDR
-    cout *= CRT_HDR_BOOST * scan_gain;  // HDR: beams can go past paper white (hdr.ini crt_boost)
+    cout *= CRT_HDR_BOOST;  // HDR: beams can go past paper white (hdr.ini crt_boost)
 #endif
     return float4(pow(max(cout, 0.0), 1.0 / monitorgamma), 1.0);
 }

@@ -50,10 +50,10 @@ Expected results:
   once to print its copy shader's hash, then again with `SHADERLOG_CRT_TARGET` set to it
   (currently `ps_d605bb2d5ca58381`, the same as the level harness). Expected output: back buffer
   format `10` (FP16), working image format `87` (8-bit) holding `255 128 255 255`, and for both
-  buffers `HUD side: 0.000 2.500 0.000   filter side: 5.508 0.548 2.500`. That is: the HUD half
+  buffers `HUD side: 0.000 2.500 0.000   filter side: 5.520 0.548 2.500`. That is: the HUD half
   at paper white with no highlight, and on the filter half red at 1.5x white rolled off toward
-  the 1000-nit peak (5.52 exact; 8-bit rounding of the grey costs a little). The log should show
-  `HDR: highlight layer 64x64`, `filter redrawn into the highlight layer` and `highlights on
+  the 1000-nit peak. The log should show
+  `HDR: highlight layer 64x64`, `filter writing the highlight layer` and `highlights on
   (final scale viewport 128x128 ...)`.
 
 With the release build, look for the same `CRT:` lines in `crt\log.txt`.
