@@ -21,17 +21,21 @@
 // ---- settings -------------------------------------------------------------------------------
 
 #define VIRTUAL_HEIGHT    270.0  // native line count of the pixel art
+#ifdef CRT_HDR
+// HDR (crt\hdr.ini): full-strength, thinner scanlines; the headroom above white pays for the gaps
+#define SCANLINE_STRENGTH 1.00
+#define BEAM_DARK         0.22
+#define BEAM_BRIGHT       0.30
+#define BRIGHTNESS        1.60
+#else
 #define SCANLINE_STRENGTH 0.70   // 0 = no scanlines, 1 = full gaps between lines
 #define BEAM_DARK         0.30   // beam thickness for dark pixels (in lines)
 #define BEAM_BRIGHT       0.50   // beam thickness for bright pixels (bright lines bloom wider)
-#define SHARPNESS         0.4   // horizontal softness, in virtual pixels (lower = sharper)
 #define BRIGHTNESS        1.30   // compensates for the light lost in the scanline gaps
-#ifdef CRT_HDR
-#define MASK_STRENGTH     0.25   // HDR (crt\hdr.ini): the extra brightness pays for a stronger mask
-#else
-#define MASK_STRENGTH     0.10   // aperture-grille RGB stripes; 0 = off. Keep low: the image
-                                 // is rescaled 1.33x to a 1440p window, so strong masks moire
 #endif
+#define SHARPNESS         0.4   // horizontal softness, in virtual pixels (lower = sharper)
+#define MASK_STRENGTH     0.10   // aperture-grille RGB stripes; 0 = off. Keep low: the image
+                                 // is rescaled to the window (1.33x at 1440p), so strong masks moire
 #define CURVATURE         0.00   // barrel distortion; try 0.03-0.06. Corners go black.
 #define GAMMA             2.2
 

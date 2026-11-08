@@ -74,14 +74,16 @@ static const float cornersize = 0.03;
 static const float cornersmooth = 1000.0;
 static const float overscan_x = 100.0;
 static const float overscan_y = 100.0;
-#ifdef CRT_HDR
-static const float DOTMASK = 0.3;       // HDR (crt\hdr.ini): the shipped mask strength
-#else
-static const float DOTMASK = 0.2;       // shipped 0.3; mask strength
-#endif
+static const float DOTMASK = 0.2;       // shipped 0.3; mask strength. Stronger moires: the mask is on the
+                                        // 1080p grid and the game rescales it to the window
 static const float DOTMASK_brightboost = 0.0;
 static const float SHARPER = 1.0;
+#ifdef CRT_HDR
+static const float scanline_weight = 0.25;  // HDR: thinner beams, near-black gaps between lines
+static const float scan_gain = 1.2;         // HDR: the light lost in the gaps, put back into the beams
+#else
 static const float scanline_weight = 0.3;
+#endif
 static const float lum = 0.3;           // shipped 0.0; scanline beam brightness
 static const float interlace_detect = 1.0;
 
@@ -160,7 +162,7 @@ float4 geom_main(PSIn i) {
     vec3 cout = mix(clow, chi, maskw);
 
 #ifdef CRT_HDR
-    cout *= CRT_HDR_BOOST;  // HDR: beams can go past paper white (hdr.ini crt_boost)
+    cout *= CRT_HDR_BOOST * scan_gain;  // HDR: beams can go past paper white (hdr.ini crt_boost)
 #endif
     return float4(pow(max(cout, 0.0), 1.0 / monitorgamma), 1.0);
 }

@@ -8,7 +8,7 @@ can be checked before it goes near the game. Each one statically imports `D3DCOM
 |---|---|
 | `level_harness.cpp` | The level path: a low-res target upscaled into a 1280x720 one. Frame capture, snapshots and the copy-back swap. It also prints which module owns key context vtable slots before and after rendering, which is how the runtime's slot swapping was found |
 | `parlor_harness.cpp` | The menu-scene pass: four draws from the real parlor texture sheet into 1920x1080, with the pass expected after draw 3 |
-| `hdr_harness.cpp` | HDR output: the swap chain and 1080p targets come back FP16, an explicit 8-bit view on the back buffer still works, and the final pass converts known values correctly |
+| `hdr_harness.cpp` | HDR output: the swap chain comes back FP16 while the game's working image stays 8-bit, the filter is redrawn into the highlight layer, the final scale is found, and the final pass adds highlights only where the HUD hasn't covered the filter |
 
 ## Building
 
@@ -46,9 +46,14 @@ Expected results:
   full-screen every time.
 
 - **HDR harness:** needs `crt\hdr.ini` with `enabled=1`, `paper_white=200`, `peak=1000`,
-  `crt_boost=1.5`. No target shader is needed. Expected output: back buffer and working image
-  format `10` (FP16), then `buffer 1 pixel: 0.544 2.500 5.520 1.000`: SDR 0.5, 1.0 (paper white,
-  200 nits = 2.5 in scRGB) and 1.5 (above white, rolled off toward the 1000-nit peak). Buffers 0
-  and 2 read back empty; that's the flip model cycling buffers.
+  `crt_boost=1.5`, and `tests\hdr_test.hlsl` copied in as the only filter (`crt\test.hlsl`). Run it
+  once to print its copy shader's hash, then again with `SHADERLOG_CRT_TARGET` set to it
+  (currently `ps_d605bb2d5ca58381`, the same as the level harness). Expected output: back buffer
+  format `10` (FP16), working image format `87` (8-bit) holding `255 128 255 255`, and for both
+  buffers `HUD side: 0.000 2.500 0.000   filter side: 5.508 0.548 2.500`. That is: the HUD half
+  at paper white with no highlight, and on the filter half red at 1.5x white rolled off toward
+  the 1000-nit peak (5.52 exact; 8-bit rounding of the grey costs a little). The log should show
+  `HDR: highlight layer 64x64`, `filter redrawn into the highlight layer` and `highlights on
+  (final scale viewport 128x128 ...)`.
 
 With the release build, look for the same `CRT:` lines in `crt\log.txt`.

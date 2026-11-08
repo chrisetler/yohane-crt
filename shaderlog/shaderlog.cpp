@@ -352,10 +352,12 @@ static bool ReadText(const std::string& path, std::string& out) {
 
 // ---------------------------------------------------------------------------------------------
 // HDR output, opt-in through <game>\crt\hdr.ini ("enabled" is read at launch; F8 rereads the rest).
-// The swap chain becomes scRGB (FP16, linear, 1.0 = 80 nits) and the game's 1080p working image
-// becomes FP16, so values above 1.0 from the filter survive the glow, HUD and final scale. A
-// last pass before Present turns the game's gamma-encoded SDR values into light: 1.0 is paper
-// white, and anything brighter (only the filter's beams get there) rolls off toward the peak.
+// The swap chain becomes scRGB (FP16, linear, 1.0 = 80 nits). The game's own render targets stay
+// 8-bit, so every game draw (glow, HUD, menus, fades) clips at each step exactly as in SDR.
+// The filter is drawn a second time into a private FP16 "highlight layer" that keeps its output
+// unclipped. A last pass before Present turns the game's gamma-encoded SDR values into light
+// (1.0 = paper white) and, where the screen still shows what the filter drew, adds back the part
+// of the layer above 1.0, mapped through the game's final scale and rolled off toward the peak.
 // F6 switches highlights off: filters built as for SDR and the output clipped at paper white.
 
 static bool g_hdr;                    // hdr.ini says enabled
@@ -365,10 +367,23 @@ static float g_paperWhite = 200.0f;   // nits for SDR white (HUD, menus, cutscen
 static float g_peak;                  // nits; 0 = what the display reports
 static float g_crtBoost = 1.5f;       // linear gain on the filter's output
 static float g_displayPeak;           // reported by the display; 0 = unknown
-// Set when the CRT filter draws (level copy-back or a scene pass); cleared each Present. On frames
-// without it (pause page, menus, F9 off) nothing should be above paper white, but some of the
-// game's own UI draws go past 1.0 (clipped in 8-bit, kept in FP16), so those frames are clipped.
+// Set when the CRT filter draws (level copy-back or a scene pass); cleared each Present.
 static bool g_crtThisFrame;
+static bool g_crtBound;  // the game's copy-back shader is bound and swapped for the filter
+
+// Highlight layer: the filter's unclipped output, redrawn into our own FP16 target.
+static bool g_inHl;                        // our redraw is in progress (draw hooks pass straight through)
+static bool g_hlValid;                     // the layer was drawn this frame
+static ID3D11Resource* g_hlSource;         // the game target the filter drew into (the 1080p working image)
+static bool g_hlScaled;                    // the game's final scale (g_hlSource -> FP16 back buffer) was seen
+static ID3D11Resource* g_hlScaleRT;        // where that final scale drew
+static D3D11_VIEWPORT g_hlVP;              // its viewport
+static ID3D11SamplerState* g_hlSampler;    // its sampler at s0, so the layer is resampled the same way
+static bool HlBegin(ID3D11DeviceContext* c);
+static void HlEnd(ID3D11DeviceContext* c);
+static void HlNoteDraw(ID3D11DeviceContext* c);
+static bool HlEnsure(UINT w, UINT h);
+static ID3D11RenderTargetView* g_hlRTV;
 
 static float HdrPeak() { return g_peak > 0 ? g_peak : g_displayPeak > 0 ? g_displayPeak : 1000.0f; }
 
@@ -529,7 +544,7 @@ static PFN_Resolve o_Resolve;
 // adopts whatever the runtime last put in a slot as the "original" to call.
 struct Slot { int index; void* hook; void** orig; };
 static void** g_ctxVt;
-static Slot g_slots[14];
+static Slot g_slots[40];
 static int g_slotCount;
 
 static void Repatch() {
@@ -567,6 +582,7 @@ static void STDMETHODCALLTYPE H_SetPS(ID3D11DeviceContext* c, ID3D11PixelShader*
     bool crt = s && s == g_copyPS && g_crtOn && g_crtPS;
     o_SetPS(c, crt ? g_crtPS : s, ci, n);
     if (crt) g_crtThisFrame = true;
+    if (!g_inHl) g_crtBound = crt;
     Lock l;
     Repatch();
     if (!g_cap) return;
@@ -584,25 +600,36 @@ static void STDMETHODCALLTYPE H_SetVS(ID3D11DeviceContext* c, ID3D11VertexShader
     g_vs = s ? (it != g_shaderName.end() ? it->second : "vs_?") : "vs_none";
     Repatch();
 }
+// After the game's own draw: if it was the filter, draw it again into the highlight layer (the
+// redraw goes back through the vtable so it uses whatever implementation the runtime has in the
+// slot now), then note a possible final scale.
 static void STDMETHODCALLTYPE H_DrawIndexed(ID3D11DeviceContext* c, UINT n, UINT a, INT b) {
+    if (g_inHl) { o_DrawIndexed(c, n, a, b); return; }
     if (g_cap) { Lock l; CapDraw("DrawIndexed", n); }
     o_DrawIndexed(c, n, a, b);
-    { Lock l; SceneAfterDraw(); if (g_cap) AfterDraw(); Repatch(); }
+    { Lock l; if (HlBegin(c)) { c->DrawIndexed(n, a, b); HlEnd(c); } }
+    { Lock l; HlNoteDraw(c); SceneAfterDraw(); if (g_cap) AfterDraw(); Repatch(); }
 }
 static void STDMETHODCALLTYPE H_Draw(ID3D11DeviceContext* c, UINT n, UINT a) {
+    if (g_inHl) { o_Draw(c, n, a); return; }
     if (g_cap) { Lock l; CapDraw("Draw", n); }
     o_Draw(c, n, a);
-    { Lock l; SceneAfterDraw(); if (g_cap) AfterDraw(); Repatch(); }
+    { Lock l; if (HlBegin(c)) { c->Draw(n, a); HlEnd(c); } }
+    { Lock l; HlNoteDraw(c); SceneAfterDraw(); if (g_cap) AfterDraw(); Repatch(); }
 }
 static void STDMETHODCALLTYPE H_DrawIndexedInst(ID3D11DeviceContext* c, UINT n, UINT inst, UINT a, INT b, UINT d) {
+    if (g_inHl) { o_DrawIndexedInst(c, n, inst, a, b, d); return; }
     if (g_cap) { Lock l; CapDraw("DrawIndexedInstanced", n * inst); }
     o_DrawIndexedInst(c, n, inst, a, b, d);
-    { Lock l; SceneAfterDraw(); if (g_cap) AfterDraw(); Repatch(); }
+    { Lock l; if (HlBegin(c)) { c->DrawIndexedInstanced(n, inst, a, b, d); HlEnd(c); } }
+    { Lock l; HlNoteDraw(c); SceneAfterDraw(); if (g_cap) AfterDraw(); Repatch(); }
 }
 static void STDMETHODCALLTYPE H_DrawInst(ID3D11DeviceContext* c, UINT n, UINT inst, UINT a, UINT b) {
+    if (g_inHl) { o_DrawInst(c, n, inst, a, b); return; }
     if (g_cap) { Lock l; CapDraw("DrawInstanced", n * inst); }
     o_DrawInst(c, n, inst, a, b);
-    { Lock l; SceneAfterDraw(); if (g_cap) AfterDraw(); Repatch(); }
+    { Lock l; if (HlBegin(c)) { c->DrawInstanced(n, inst, a, b); HlEnd(c); } }
+    { Lock l; HlNoteDraw(c); SceneAfterDraw(); if (g_cap) AfterDraw(); Repatch(); }
 }
 static void STDMETHODCALLTYPE H_OMSetRT(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const* v, ID3D11DepthStencilView* d) {
     o_OMSetRT(c, n, v, d);
@@ -629,8 +656,8 @@ static void STDMETHODCALLTYPE H_OMSetRT(ID3D11DeviceContext* c, UINT n, ID3D11Re
 }
 static void STDMETHODCALLTYPE H_SetVP(ID3D11DeviceContext* c, UINT n, const D3D11_VIEWPORT* v) {
     o_SetVP(c, n, v);
-    if (!g_cap) return;
     Lock l;
+    if (!g_cap) { Repatch(); return; }
     if (n && v) {
         char s[64];
         sprintf_s(s, "%gx%g@%g,%g", v[0].Width, v[0].Height, v[0].TopLeftX, v[0].TopLeftY);
@@ -646,7 +673,7 @@ static void STDMETHODCALLTYPE H_CopySub(ID3D11DeviceContext* c, ID3D11Resource* 
     if (g_cap && !g_inSnap) { Lock l; CapEvent("COPY region %s -> %s", ResDesc(src).c_str(), ResDesc(dst).c_str()); }
     if (g_hdr && !g_inSnap) { Lock l; if (HdrCopyMismatch(dst, src)) LogCopyMismatch("copied region", dst, src, false); }
     o_CopySub(c, dst, a, x, y, z, src, b, box);
-    if (g_cap) { Lock l; Repatch(); }
+    { Lock l; Repatch(); }
 }
 static void STDMETHODCALLTYPE H_Copy(ID3D11DeviceContext* c, ID3D11Resource* dst, ID3D11Resource* src) {
     if (g_cap) { Lock l; CapEvent("COPY %s -> %s", ResDesc(src).c_str(), ResDesc(dst).c_str()); }
@@ -659,17 +686,17 @@ static void STDMETHODCALLTYPE H_Copy(ID3D11DeviceContext* c, ID3D11Resource* dst
         }
     }
     o_Copy(c, dst, src);
-    if (g_cap) { Lock l; Repatch(); }
+    { Lock l; Repatch(); }
 }
 static void STDMETHODCALLTYPE H_ClearRTV(ID3D11DeviceContext* c, ID3D11RenderTargetView* v, const FLOAT col[4]) {
     if (g_cap) { Lock l; CapEvent("CLEAR %s (%.2f %.2f %.2f %.2f)", ViewDesc(v).c_str(), col[0], col[1], col[2], col[3]); }
     o_ClearRTV(c, v, col);
-    if (g_cap) { Lock l; Repatch(); }
+    { Lock l; Repatch(); }
 }
 static void STDMETHODCALLTYPE H_Resolve(ID3D11DeviceContext* c, ID3D11Resource* dst, UINT a, ID3D11Resource* src, UINT b, DXGI_FORMAT f) {
     if (g_cap) { Lock l; CapEvent("RESOLVE %s -> %s", ResDesc(src).c_str(), ResDesc(dst).c_str()); }
     o_Resolve(c, dst, a, src, b, f);
-    if (g_cap) { Lock l; Repatch(); }
+    { Lock l; Repatch(); }
 }
 
 #ifndef CRT_RELEASE
@@ -677,6 +704,29 @@ typedef void(STDMETHODCALLTYPE* PFN_UpdateSub)(ID3D11DeviceContext*, ID3D11Resou
 static PFN_UpdateSub o_UpdateSub;
 static void STDMETHODCALLTYPE H_UpdateSub(ID3D11DeviceContext*, ID3D11Resource*, UINT, const D3D11_BOX*, const void*, UINT, UINT);
 #endif
+
+// Pass-through hooks on the other state setters the game calls before a draw. They only re-assert
+// our slots: a setter the runtime handles by swapping the Draw entries would otherwise leave the
+// next draw un-hooked (the highlight-layer redraw and scene counting both need every draw).
+#define PASS_HOOK(name, PARAMS, ARGS)                                         \
+    typedef void(STDMETHODCALLTYPE* PFN_##name) PARAMS;                       \
+    static PFN_##name o_##name;                                               \
+    static void STDMETHODCALLTYPE H_##name PARAMS { o_##name ARGS; Lock lk; Repatch(); }
+PASS_HOOK(VSSetCB, (ID3D11DeviceContext* c, UINT a, UINT n, ID3D11Buffer* const* b), (c, a, n, b))
+PASS_HOOK(PSSetSamp, (ID3D11DeviceContext* c, UINT a, UINT n, ID3D11SamplerState* const* s), (c, a, n, s))
+PASS_HOOK(Unmap, (ID3D11DeviceContext* c, ID3D11Resource* r, UINT sub), (c, r, sub))
+PASS_HOOK(PSSetCB, (ID3D11DeviceContext* c, UINT a, UINT n, ID3D11Buffer* const* b), (c, a, n, b))
+PASS_HOOK(IASetLayout, (ID3D11DeviceContext* c, ID3D11InputLayout* l), (c, l))
+PASS_HOOK(IASetVB, (ID3D11DeviceContext* c, UINT a, UINT n, ID3D11Buffer* const* b, const UINT* s, const UINT* o), (c, a, n, b, s, o))
+PASS_HOOK(IASetIB, (ID3D11DeviceContext* c, ID3D11Buffer* b, DXGI_FORMAT f, UINT o), (c, b, f, o))
+PASS_HOOK(IASetTopo, (ID3D11DeviceContext* c, D3D11_PRIMITIVE_TOPOLOGY t), (c, t))
+PASS_HOOK(VSSetSRV, (ID3D11DeviceContext* c, UINT a, UINT n, ID3D11ShaderResourceView* const* v), (c, a, n, v))
+PASS_HOOK(VSSetSamp, (ID3D11DeviceContext* c, UINT a, UINT n, ID3D11SamplerState* const* s), (c, a, n, s))
+PASS_HOOK(OMSetBlend, (ID3D11DeviceContext* c, ID3D11BlendState* b, const FLOAT f[4], UINT m), (c, b, f, m))
+PASS_HOOK(OMSetDepth, (ID3D11DeviceContext* c, ID3D11DepthStencilState* d, UINT r), (c, d, r))
+PASS_HOOK(RSSetState, (ID3D11DeviceContext* c, ID3D11RasterizerState* r), (c, r))
+PASS_HOOK(RSSetScissor, (ID3D11DeviceContext* c, UINT n, const D3D11_RECT* r), (c, n, r))
+#undef PASS_HOOK
 
 static void HookContext(ID3D11DeviceContext* ctx) {
     Slot s[] = {
@@ -688,6 +738,13 @@ static void HookContext(ID3D11DeviceContext* ctx) {
         {44, H_SetVP, (void**)&o_SetVP},              {46, H_CopySub, (void**)&o_CopySub},
         {47, H_Copy, (void**)&o_Copy},                {50, H_ClearRTV, (void**)&o_ClearRTV},
         {57, H_Resolve, (void**)&o_Resolve},
+        {7, H_VSSetCB, (void**)&o_VSSetCB},           {10, H_PSSetSamp, (void**)&o_PSSetSamp},
+        {15, H_Unmap, (void**)&o_Unmap},              {16, H_PSSetCB, (void**)&o_PSSetCB},
+        {17, H_IASetLayout, (void**)&o_IASetLayout},  {18, H_IASetVB, (void**)&o_IASetVB},
+        {19, H_IASetIB, (void**)&o_IASetIB},          {24, H_IASetTopo, (void**)&o_IASetTopo},
+        {25, H_VSSetSRV, (void**)&o_VSSetSRV},        {26, H_VSSetSamp, (void**)&o_VSSetSamp},
+        {35, H_OMSetBlend, (void**)&o_OMSetBlend},    {36, H_OMSetDepth, (void**)&o_OMSetDepth},
+        {43, H_RSSetState, (void**)&o_RSSetState},    {45, H_RSSetScissor, (void**)&o_RSSetScissor},
     };
     memcpy(g_slots, s, sizeof s);
     g_slotCount = (int)(sizeof s / sizeof s[0]);
@@ -881,6 +938,18 @@ static void RunScenePass(ID3D11Resource* target) {
     GameState st(c, false);
     DrawFullscreen(c, g_crtPS, g_sceneCopySRV);  // the filter over the whole target
     g_crtThisFrame = true;
+    if (g_hdrActive && g_hdrHighlights && HlEnsure(d.Width, d.Height)) {  // and again, unclipped
+        ID3D11RenderTargetView* rtv = nullptr;
+        ID3D11DepthStencilView* dsv = nullptr;
+        c->OMGetRenderTargets(1, &rtv, &dsv);
+        c->OMSetRenderTargets(1, &g_hlRTV, nullptr);
+        c->Draw(3, 0);
+        c->OMSetRenderTargets(1, &rtv, dsv);
+        if (rtv) rtv->Release();
+        if (dsv) dsv->Release();
+        g_hlSource = target;
+        g_hlValid = true;
+    }
     st.Restore(c);
     g_inScenePass = g_inSnap = false;
 }
@@ -907,14 +976,35 @@ static void SceneAfterDraw() {
 // ---------------------------------------------------------------------------------------------
 // HDR output: the pass before Present, and copies the FP16 working image no longer matches.
 
+// t0: the finished SDR frame. With HIGHLIGHTS, t1 is the highlight layer (the filter's unclipped
+// output at the working image's size), sampled with the game's final-scale sampler through the
+// final-scale viewport (b0: x, y, 1/w, 1/h) so it lines up with what the game put on screen.
 static const char* kHdrPS = R"(
 Texture2D Img : register(t0);
+#if HIGHLIGHTS
+Texture2D Hl : register(t1);
+SamplerState S : register(s0);
+cbuffer V : register(b0) { float4 vp; };
+#endif
 float4 main(float4 pos : SV_Position) : SV_Target {
     // the game's values are gamma-encoded for an SDR screen; 1.0 = paper white
     float3 x = pow(max(Img.Load(int3(pos.xy, 0)).rgb, 0.0), 2.2);
 #if HIGHLIGHTS
-    float k = PEAK_REL - 1.0;  // headroom above paper white; roll off smoothly into it
-    x = k > 0.0 ? (x > 1.0 ? 1.0 + k * (1.0 - exp(-(x - 1.0) / k)) : x) : min(x, 1.0);
+    float2 uv = (pos.xy - vp.xy) * vp.zw;
+    if (all(uv > 0.0) && all(uv < 1.0)) {
+        float3 E = max(Hl.SampleLevel(S, uv, 0).rgb, 0.0);
+        float3 e = pow(E, 2.2), c = pow(min(E, 1.0), 2.2);  // unclipped filter output, and what the game kept
+        float3 extra = e - c;
+        if (any(extra > 0.0)) {
+            // How much of the filtered pixel is still on screen: k scales for fades and dark
+            // overlays; anything that isn't a scaled copy of it (HUD, text) shows up as err.
+            float k = dot(x, c) / max(dot(c, c), 1e-6);
+            float err = length(x - k * c) / max(length(x), 0.02);
+            x += saturate(1.0 - err * 4.0) * saturate(k) * extra;
+        }
+    }
+    float h = PEAK_REL - 1.0;  // headroom above paper white; roll off smoothly into it
+    x = h > 0.0 ? (x > 1.0 ? 1.0 + h * (1.0 - exp(-(x - 1.0) / h)) : x) : min(x, 1.0);
 #else
     x = min(x, 1.0);
 #endif
@@ -923,10 +1013,52 @@ float4 main(float4 pos : SV_Position) : SV_Target {
 static const char* kBlitPS = "Texture2D t:register(t0);float4 main(float4 p:SV_Position):SV_Target{return t.Load(int3(p.xy,0));}";
 
 static ID3D11PixelShader* g_hdrPS;
-static ID3D11PixelShader* g_hdrPSClip;  // HIGHLIGHTS 0, for frames the filter didn't draw
+static ID3D11PixelShader* g_hdrPSClip;  // HIGHLIGHTS 0, for frames without highlights
 static ID3D11PixelShader* g_blitPS;
 static ID3D11Texture2D* g_hdrCopy;
 static ID3D11ShaderResourceView* g_hdrCopySRV;
+
+static ID3D11Texture2D* g_hlTex;
+static ID3D11ShaderResourceView* g_hlSRV;
+static ID3D11Buffer* g_hlCB;  // final-scale viewport for kHdrPS
+
+// (Re)creates the highlight layer at w x h, FP16, plus the constant buffer the final pass uses.
+static bool HlEnsure(UINT w, UINT h) {
+    if (!g_dev) return false;
+    if (g_hlTex) {
+        D3D11_TEXTURE2D_DESC cd;
+        g_hlTex->GetDesc(&cd);
+        if (cd.Width == w && cd.Height == h) return true;
+        g_hlSRV->Release(); g_hlSRV = nullptr;
+        g_hlRTV->Release(); g_hlRTV = nullptr;
+        g_hlTex->Release(); g_hlTex = nullptr;
+    }
+    D3D11_TEXTURE2D_DESC cd = {w, h, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, {1, 0}, D3D11_USAGE_DEFAULT,
+                               D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0, 0};
+    if (FAILED(g_dev->CreateTexture2D(&cd, nullptr, &g_hlTex))) { g_hlTex = nullptr; Log("HDR: highlight layer %ux%u failed", w, h); return false; }
+    if (FAILED(g_dev->CreateRenderTargetView(g_hlTex, nullptr, &g_hlRTV)) ||
+        FAILED(g_dev->CreateShaderResourceView(g_hlTex, nullptr, &g_hlSRV))) {
+        if (g_hlRTV) { g_hlRTV->Release(); g_hlRTV = nullptr; }
+        if (g_hlSRV) { g_hlSRV->Release(); g_hlSRV = nullptr; }
+        g_hlTex->Release(); g_hlTex = nullptr;
+        Log("HDR: highlight layer views failed");
+        return false;
+    }
+    if (!g_hlCB) {
+        D3D11_BUFFER_DESC bd = {16, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0};
+        if (FAILED(g_dev->CreateBuffer(&bd, nullptr, &g_hlCB))) g_hlCB = nullptr;
+    }
+    Log("HDR: highlight layer %ux%u", w, h);
+    return true;
+}
+
+// The layer and the final scale's viewport and sampler carry over between frames, so a frame where
+// a hook is missed reuses the last ones instead of blinking the highlights off. Reset on resize.
+static void HlReset() {
+    g_hlValid = g_hlScaled = false;
+    g_hlSource = g_hlScaleRT = nullptr;
+    if (g_hlSampler) { g_hlSampler->Release(); g_hlSampler = nullptr; }
+}
 
 static ID3D11PixelShader* CompilePS(const char* src, const D3D_SHADER_MACRO* defs, const char* name) {
     LoadReal();
@@ -949,7 +1081,7 @@ static void BuildHdrShader() {
     char paper[32], peak[32];
     sprintf_s(paper, "%f", g_paperWhite / 80.0f);
     sprintf_s(peak, "%f", HdrPeak() / g_paperWhite);
-    D3D_SHADER_MACRO d[] = {{"PAPER", paper}, {"PEAK_REL", peak}, {"HIGHLIGHTS", g_hdrHighlights ? "1" : "0"}, {nullptr, nullptr}};
+    D3D_SHADER_MACRO d[] = {{"PAPER", paper}, {"PEAK_REL", peak}, {"HIGHLIGHTS", "1"}, {nullptr, nullptr}};
     g_hdrPS = CompilePS(kHdrPS, d, "hdr_output");
     d[2].Definition = "0";
     g_hdrPSClip = CompilePS(kHdrPS, d, "hdr_output_clip");
@@ -985,17 +1117,31 @@ static void HdrPass(IDXGISwapChain* sc) {
     }
     bool filtered = g_crtThisFrame;
     g_crtThisFrame = false;
-    static int lastFiltered = -1;
-    if ((int)filtered != lastFiltered) {
-        lastFiltered = filtered;
-        Log("HDR: %s", filtered ? "filter drawing, highlights allowed" : "no filter this frame, clipped at paper white");
-    }
-    ID3D11PixelShader* ps = filtered ? g_hdrPS : g_hdrPSClip;
-    if (!g_fullscreenVS || !g_noDepth || !ps) return;
+    if (!g_fullscreenVS || !g_noDepth || !g_hdrPS || !g_hdrPSClip) return;
     ID3D11Texture2D* bb = nullptr;
     if (FAILED(sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&bb))) return;
     D3D11_TEXTURE2D_DESC d;
     bb->GetDesc(&d);
+
+    // Highlights only where this frame's filter output can be traced to the screen.
+    bool hl = filtered && g_hdrHighlights && g_hlValid && g_hlScaled && g_hlScaleRT == bb && g_hlSRV && g_hlCB;
+    const char* why = !filtered            ? "no filter this frame, clipped at paper white"
+                      : !g_hdrHighlights   ? "highlights off (F6), clipped at paper white"
+                      : !g_hlValid         ? "filter drew but the highlight layer didn't; clipped"
+                      : !g_hlScaled        ? "couldn't find the game's final scale to the screen; clipped"
+                      : g_hlScaleRT != bb  ? "the final scale didn't draw to the back buffer; clipped"
+                      : hl                 ? "highlights on"
+                                           : "highlight resources missing; clipped";
+    static const char* lastWhy;
+    if (why != lastWhy) {
+        lastWhy = why;
+        if (hl)
+            Log("HDR: highlights on (final scale viewport %gx%g at %g,%g into %ux%u)", g_hlVP.Width, g_hlVP.Height,
+                g_hlVP.TopLeftX, g_hlVP.TopLeftY, d.Width, d.Height);
+        else
+            Log("HDR: %s", why);
+    }
+    ID3D11PixelShader* ps = hl ? g_hdrPS : g_hdrPSClip;
     if (g_hdrCopy) {
         D3D11_TEXTURE2D_DESC cd;
         g_hdrCopy->GetDesc(&cd);
@@ -1020,7 +1166,35 @@ static void HdrPass(IDXGISwapChain* sc) {
         c->OMSetRenderTargets(1, &rtv, nullptr);
         D3D11_VIEWPORT vp = {0, 0, (float)d.Width, (float)d.Height, 0, 1};
         c->RSSetViewports(1, &vp);
+        ID3D11ShaderResourceView* oldT1 = nullptr;
+        ID3D11SamplerState* oldS0 = nullptr;
+        ID3D11Buffer* oldB0 = nullptr;
+        if (hl) {
+            c->PSGetShaderResources(1, 1, &oldT1);
+            c->PSGetSamplers(0, 1, &oldS0);
+            c->PSGetConstantBuffers(0, 1, &oldB0);
+            D3D11_MAPPED_SUBRESOURCE m;
+            if (SUCCEEDED(c->Map(g_hlCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+                float* f = (float*)m.pData;
+                f[0] = g_hlVP.TopLeftX;
+                f[1] = g_hlVP.TopLeftY;
+                f[2] = g_hlVP.Width > 0 ? 1.0f / g_hlVP.Width : 0.0f;
+                f[3] = g_hlVP.Height > 0 ? 1.0f / g_hlVP.Height : 0.0f;
+                c->Unmap(g_hlCB, 0);
+            }
+            c->PSSetShaderResources(1, 1, &g_hlSRV);
+            c->PSSetSamplers(0, 1, &g_hlSampler);  // null = the default linear sampler
+            c->PSSetConstantBuffers(0, 1, &g_hlCB);
+        }
         DrawFullscreen(c, ps, g_hdrCopySRV);
+        if (hl) {
+            c->PSSetShaderResources(1, 1, &oldT1);
+            c->PSSetSamplers(0, 1, &oldS0);
+            c->PSSetConstantBuffers(0, 1, &oldB0);
+            if (oldT1) oldT1->Release();
+            if (oldS0) oldS0->Release();
+            if (oldB0) oldB0->Release();
+        }
         st.Restore(c);
         g_inScenePass = g_inSnap = false;
         rtv->Release();
@@ -1038,7 +1212,7 @@ static DXGI_FORMAT TexFormat(ID3D11Resource* r, D3D11_TEXTURE2D_DESC* out = null
     return d.Format;
 }
 
-// The game copying between its FP16 working image and an 8-bit texture would fail silently
+// The game copying between the FP16 back buffer and an 8-bit texture would fail silently
 // (copies need matching formats), so same-size copies into a render target are redone as a draw.
 // Anything else is logged; the handoff notes say what to look for.
 static bool HdrCopyMismatch(ID3D11Resource* dst, ID3D11Resource* src) {
@@ -1084,6 +1258,55 @@ static bool BlitCopy(ID3D11Resource* dst, ID3D11Resource* src) {
     if (rtv) rtv->Release();
     if (srv) srv->Release();
     return ok;
+}
+
+// The game's copy-back draw with the filter bound: point it at the highlight layer (same size,
+// same viewport, blending off) for a second identical draw. HlEnd puts the game's target back.
+static ID3D11RenderTargetView* g_hlSavedRTV;
+static ID3D11DepthStencilView* g_hlSavedDSV;
+static ID3D11BlendState* g_hlSavedBS;
+static FLOAT g_hlSavedBF[4];
+static UINT g_hlSavedBM;
+
+static bool HlBegin(ID3D11DeviceContext* c) {
+    if (!g_crtBound || !g_hdrActive || !g_hdrHighlights || !g_curRT || g_inScenePass) return false;
+    D3D11_TEXTURE2D_DESC d;
+    if (TexFormat(g_curRT, &d) == DXGI_FORMAT_UNKNOWN || !HlEnsure(d.Width, d.Height)) return false;
+    g_hlSource = g_curRT;
+    c->OMGetRenderTargets(1, &g_hlSavedRTV, &g_hlSavedDSV);
+    c->OMGetBlendState(&g_hlSavedBS, g_hlSavedBF, &g_hlSavedBM);
+    g_inHl = true;
+    c->OMSetRenderTargets(1, &g_hlRTV, nullptr);
+    c->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+    return true;
+}
+
+static void HlEnd(ID3D11DeviceContext* c) {
+    c->OMSetRenderTargets(1, &g_hlSavedRTV, g_hlSavedDSV);
+    c->OMSetBlendState(g_hlSavedBS, g_hlSavedBF, g_hlSavedBM);
+    if (g_hlSavedRTV) g_hlSavedRTV->Release();
+    if (g_hlSavedDSV) g_hlSavedDSV->Release();
+    if (g_hlSavedBS) g_hlSavedBS->Release();
+    g_hlSavedRTV = nullptr; g_hlSavedDSV = nullptr; g_hlSavedBS = nullptr;
+    g_inHl = false;
+    g_hlValid = true;
+    static bool logged;
+    if (!logged) { logged = true; Log("HDR: filter redrawn into the highlight layer"); }
+}
+
+// After any game draw: one that reads the filtered image and writes the FP16 back buffer (the
+// only FP16 target the game has now) is the final scale. Keep its viewport and sampler.
+static void HlNoteDraw(ID3D11DeviceContext* c) {
+    if (!g_hlValid || g_inHl || g_inScenePass || !g_srv0Res || g_srv0Res != g_hlSource || !g_curRT || g_curRT == g_hlSource)
+        return;
+    if (TexFormat(g_curRT) != DXGI_FORMAT_R16G16B16A16_FLOAT) return;
+    UINT n = 1;
+    c->RSGetViewports(&n, &g_hlVP);
+    if (!n) return;
+    if (g_hlSampler) g_hlSampler->Release();
+    c->PSGetSamplers(0, 1, &g_hlSampler);
+    g_hlScaleRT = g_curRT;
+    g_hlScaled = true;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1209,6 +1432,7 @@ static HRESULT STDMETHODCALLTYPE H_Resize(IDXGISwapChain* sc, UINT n, UINT w, UI
     }
     HRESULT hr = o_Resize(sc, n, w, h, fmt, flags);
     Lock l;
+    HlReset();  // the final scale's viewport changes with the window
     if (FAILED(hr)) Log("HDR: ResizeBuffers %ux%u failed (%08lx)", w, h, hr);
     else if (g_hdrActive) { SetColorSpace(sc); QueryDisplay(sc); BuildHdrShader(); }
     return hr;
@@ -1437,23 +1661,14 @@ static HRESULT STDMETHODCALLTYPE H_CreatePS(ID3D11Device* d, const void* code, S
     }
     return hr;
 }
-// HDR: the game's full-size 8-bit render targets (the 1080p working image and its scratch copies)
-// are made FP16, so the filter's output above 1.0 isn't clipped before the final pass.
+// HDR: the game's own render targets stay 8-bit (see "HDR output"); only the swap chain is FP16,
+// so its views below may need their format corrected.
 static bool Is8BitRGBA(DXGI_FORMAT f) {
     return f == DXGI_FORMAT_R8G8B8A8_UNORM || f == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || f == DXGI_FORMAT_R8G8B8A8_TYPELESS ||
            f == DXGI_FORMAT_B8G8R8A8_UNORM || f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || f == DXGI_FORMAT_B8G8R8A8_TYPELESS;
 }
 
 static HRESULT STDMETHODCALLTYPE H_CreateTex2D(ID3D11Device* d, const D3D11_TEXTURE2D_DESC* desc, const D3D11_SUBRESOURCE_DATA* init, ID3D11Texture2D** out) {
-    D3D11_TEXTURE2D_DESC up;
-    if (g_hdr && desc && !init && (desc->BindFlags & D3D11_BIND_RENDER_TARGET) && desc->Width >= 1280 &&
-        desc->SampleDesc.Count == 1 && (desc->Format == DXGI_FORMAT_B8G8R8A8_UNORM || desc->Format == DXGI_FORMAT_R8G8B8A8_UNORM)) {
-        up = *desc;
-        up.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-        desc = &up;
-        Lock l;
-        Log("HDR: render target %ux%u made FP16", up.Width, up.Height);
-    }
     HRESULT hr = o_CreateTex2D(d, desc, init, out);
     if (SUCCEEDED(hr) && out && *out) { Lock l; g_texScene.erase(*out); }  // address may be reused
 #ifndef CRT_RELEASE
